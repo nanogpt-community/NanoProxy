@@ -434,6 +434,28 @@ function compactSchema(schema, depth = 0) {
   return out;
 }
 
+function contentPartsToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object") {
+          if (typeof part.text === "string") return part.text;
+          if (typeof part.content === "string") return part.content;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("");
+  }
+  if (content && typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (typeof content.content === "string") return content.content;
+  }
+  return "";
+}
+
 function encodeToolCallsBlock(toolCalls) {
   const callBlocks = toolCalls.map((call) => {
     const payload = {
@@ -458,7 +480,7 @@ function encodeToolCallsBlock(toolCalls) {
 function encodeToolResultBlock(message) {
   const payload = {
     tool_call_id: message.tool_call_id || "",
-    content: message.content || ""
+    content: contentPartsToText(message.content)
   };
   return [
     "",
@@ -570,7 +592,7 @@ function translateMessagesForBridge(messages, tools) {
 
   for (const message of messages || []) {
     if (message.role === "system") {
-      out.push({ role: "system", content: message.content || "" });
+      out.push({ role: "system", content: contentPartsToText(message.content) });
       continue;
     }
 
@@ -585,7 +607,7 @@ function translateMessagesForBridge(messages, tools) {
         continue;
       }
 
-      const content = typeof message.content === "string" ? message.content : "";
+      const content = contentPartsToText(message.content);
       const reasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
       out.push({ role: "assistant", content: content || reasoning || "" });
       continue;
@@ -599,13 +621,13 @@ function translateMessagesForBridge(messages, tools) {
     if (message.role === "user") {
       out.push({
         role: "user",
-        content: encodeUserMessageForBridge(message.content || "", { firstTurn: !firstUserSeen })
+        content: encodeUserMessageForBridge(contentPartsToText(message.content), { firstTurn: !firstUserSeen })
       });
       firstUserSeen = true;
       continue;
     }
 
-    out.push({ role: message.role, content: message.content || "" });
+    out.push({ role: message.role, content: contentPartsToText(message.content) });
   }
 
   if (!bridgeInserted) {

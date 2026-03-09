@@ -81,6 +81,54 @@ function run() {
   const bridgedUserMessage = requestWithToolResult.rewritten.messages.find((msg) => msg.role === "user" && /Protocol requirements for your next reply/.test(msg.content || ""));
   assert.ok(bridgedUserMessage);
 
+  const requestWithTypedToolResult = transformRequestForBridge({
+    model: "zai-org/glm-5:thinking",
+    tools: [
+      {
+        name: "write",
+        description: "Write a file",
+        parameters: { type: "object", properties: { filePath: { type: "string" } } }
+      }
+    ],
+    messages: [
+      { role: "user", content: "do it" },
+      {
+        role: "tool",
+        tool_call_id: "call_456",
+        content: [
+          { type: "text", text: "Wrote file successfully." },
+          { type: "text", text: "\nNext file ready." }
+        ]
+      }
+    ]
+  });
+  const bridgedTypedToolResultMessage = requestWithTypedToolResult.rewritten.messages.find((msg) => msg.role === "user" && /opencode-tool-result/.test(msg.content || ""));
+  assert.ok(bridgedTypedToolResultMessage);
+  assert.match(bridgedTypedToolResultMessage.content, /Wrote file successfully\./);
+  assert.match(bridgedTypedToolResultMessage.content, /Next file ready\./);
+
+  const requestWithTypedUserContent = transformRequestForBridge({
+    model: "zai-org/glm-5:thinking",
+    tools: [
+      {
+        name: "read",
+        description: "Read a file",
+        parameters: { type: "object", properties: { filePath: { type: "string" } } }
+      }
+    ],
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "I want a pie recipe" },
+          { type: "text", text: "\n<system-reminder>plan</system-reminder>" }
+        ]
+      }
+    ]
+  });
+  assert.match(requestWithTypedUserContent.rewritten.messages[2].content, /I want a pie recipe/);
+  assert.match(requestWithTypedUserContent.rewritten.messages[2].content, /system-reminder/);
+
   const parsedTool = parseBridgeAssistantText("```opencode-tool\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"hi\"}}]}\n```");
   assert.equal(parsedTool.kind, "tool_calls");
   assert.equal(parsedTool.toolCalls[0].function.name, "write");
