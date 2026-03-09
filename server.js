@@ -460,7 +460,8 @@ function encodeToolResultBlock(message) {
     `Your next reply must be exactly one envelope: either ${TOOL_MODE_MARKER} ... ${TOOL_MODE_END_MARKER} or ${FINAL_MODE_MARKER} ... ${FINAL_MODE_END_MARKER}.`,
     "Do not narrate the next step in plain text.",
     "Do not say what you are about to do.",
-    "Either call the next tool immediately or give the final answer envelope."
+    "If more than one independent tool call is needed, you may include multiple items in tool_calls.",
+    "Otherwise call the next tool immediately or give the final answer envelope."
   ].join("\n");
 }
 
@@ -500,18 +501,26 @@ function buildBridgeSystemMessage(tools) {
     `- Output ${TOOL_MODE_MARKER} first and ${TOOL_MODE_END_MARKER} last.`,
     "- Do not use markdown code fences for tool replies.",
     "- Do not write any explanatory prose before, inside, or after the tool envelope.",
-    "- Emit exactly one tool call per assistant turn.",
-    "- Do not batch multiple tool calls together.",
-    "- After each tool result, decide the next single tool call.",
+    "- Emit one or more tool calls only when they are independent and can be executed in parallel or as a batch.",
+    "- If several reads/searches are needed immediately, include them together in tool_calls.",
+    "- If sequencing matters, emit only the next required tool call.",
+    "- After each tool result, decide the next tool call or tool_calls batch.",
     "- On the first assistant turn for a coding task, usually call a search/read/list tool first.",
     "- Use tool names exactly as listed.",
     "- arguments must be a valid JSON object.",
-    "- tool_calls must contain exactly one item.",
+    "- tool_calls must contain at least one item.",
     "Invalid response example:",
     "I will inspect the codebase first.",
     "Valid response example:",
     TOOL_MODE_MARKER,
     JSON.stringify({ tool_calls: [{ name: "read", arguments: { filePath: "src/app.js" } }] }, null, 2),
+    TOOL_MODE_END_MARKER,
+    "Valid multi-tool example:",
+    TOOL_MODE_MARKER,
+    JSON.stringify({ tool_calls: [
+      { name: "read", arguments: { filePath: "src/app.js" } },
+      { name: "read", arguments: { filePath: "src/styles.css" } }
+    ] }, null, 2),
     TOOL_MODE_END_MARKER,
     `If you are giving a final answer to the user and no tool is needed, use this exact envelope:`,
     FINAL_MODE_MARKER,
@@ -823,7 +832,6 @@ function parseAnyFencedJsonPayload(text) {
 function normalizeParsedToolCalls(rawCalls) {
   return rawCalls
     .filter((call) => call && typeof call === "object" && typeof call.name === "string")
-    .slice(0, 1)
     .map((call) => ({
       id: generateToolCallId(),
       type: "function",
@@ -1124,27 +1132,29 @@ function buildSSEFromBridge(aggregate) {
   }
 
   if (result.kind === "tool_calls") {
-    out += sseLine({
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model,
-      choices: [{
-        index: 0,
-        delta: {
-          tool_calls: result.message.tool_calls.map((call, index) => ({
-            index,
-            id: call.id,
-            type: "function",
-            function: {
-              name: call.function.name,
-              arguments: call.function.arguments
-            }
-          }))
-        },
-        finish_reason: null
-      }]
-    });
+    for (const [index, call] of result.message.tool_calls.entries()) {
+      out += sseLine({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index,
+              id: call.id,
+              type: "function",
+              function: {
+                name: call.function.name,
+                arguments: call.function.arguments
+              }
+            }]
+          },
+          finish_reason: null
+        }]
+      });
+    }
 
     out += sseLine({
       id,
@@ -1380,27 +1390,29 @@ async function proxyRequest(req, res) {
       return;
     }
 
-    res.write(sseLine({
-      id: aggregate.id || `chatcmpl_${randomUUID()}`,
-      object: "chat.completion.chunk",
-      created: aggregate.created || Math.floor(Date.now() / 1000),
-      model: aggregate.model || "tool-bridge",
-      choices: [{
-        index: 0,
-        delta: {
-          tool_calls: result.message.tool_calls.map((call, index) => ({
-            index,
-            id: call.id,
-            type: "function",
-            function: {
-              name: call.function.name,
-              arguments: call.function.arguments
-            }
-          }))
-        },
-        finish_reason: null
-      }]
-    }));
+    for (const [index, call] of result.message.tool_calls.entries()) {
+      res.write(sseLine({
+        id: aggregate.id || `chatcmpl_${randomUUID()}`,
+        object: "chat.completion.chunk",
+        created: aggregate.created || Math.floor(Date.now() / 1000),
+        model: aggregate.model || "tool-bridge",
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index,
+              id: call.id,
+              type: "function",
+              function: {
+                name: call.function.name,
+                arguments: call.function.arguments
+              }
+            }]
+          },
+          finish_reason: null
+        }]
+      }));
+    }
     res.write(sseLine({
       id: aggregate.id || `chatcmpl_${randomUUID()}`,
       object: "chat.completion.chunk",

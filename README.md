@@ -104,6 +104,17 @@ Tool use:
 [[/OPENCODE_TOOL]]
 ```
 
+Multiple tool calls in one turn are also allowed when they are independent:
+
+```text
+[[OPENCODE_TOOL]]
+{"tool_calls":[
+  {"name":"read","arguments":{"filePath":"src/app.js"}},
+  {"name":"read","arguments":{"filePath":"src/styles.css"}}
+]}
+[[/OPENCODE_TOOL]]
+```
+
 Final answer:
 
 ```text
@@ -118,6 +129,7 @@ done
 
 - Reasoning streams live.
 - Tool and final content are buffered until the proxy can classify them safely.
+- If the model returns multiple tool calls in one tool envelope, the proxy forwards them as separate tool-call chunks in the same assistant turn.
 - This means reliability is prioritized over raw token-by-token passthrough for tool turns.
 - Requests without `tools` are forwarded normally.
 - For bridged tool turns, the proxy caps upstream `temperature` and `top_p` to reduce protocol drift.

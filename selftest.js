@@ -68,6 +68,7 @@ function run() {
   assert.ok(bridgedToolResultMessage);
   assert.match(bridgedToolResultMessage.content, /Your next reply must be exactly one envelope/);
   assert.match(bridgedToolResultMessage.content, /Do not narrate the next step in plain text/);
+  assert.match(bridgedToolResultMessage.content, /multiple items in tool_calls/);
   const bridgedUserMessage = requestWithToolResult.rewritten.messages.find((msg) => msg.role === "user" && /Protocol requirements for your next reply/.test(msg.content || ""));
   assert.ok(bridgedUserMessage);
 
@@ -158,8 +159,9 @@ function run() {
     "{\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}},{\"name\":\"write\",\"arguments\":{\"filePath\":\"b.txt\",\"content\":\"x\"}}]}"
   );
   assert.equal(parsedMultiTool.kind, "tool_calls");
-  assert.equal(parsedMultiTool.toolCalls.length, 1);
+  assert.equal(parsedMultiTool.toolCalls.length, 2);
   assert.equal(parsedMultiTool.toolCalls[0].function.name, "read");
+  assert.equal(parsedMultiTool.toolCalls[1].function.name, "write");
 
   const parsedMultilineStringTool = parseBridgeAssistantText(
     "{\n  \"tool_calls\": [\n    {\n      \"name\": \"edit\",\n      \"arguments\": {\n        \"filePath\": \"C:\\\\x\\\\main.css\",\n        \"oldString\": \"line1\nline2\nline3\",\n        \"newString\": \"done\"\n      }\n    }\n  ]\n}"
@@ -191,6 +193,18 @@ function run() {
   assert.equal(completion.choices[0].message.content, "");
   assert.equal(completion.choices[0].message.tool_calls[0].function.name, "write");
 
+  const multiToolTranscript = parseSSETranscript([
+    'data: {"id":"chatcmpl_2","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+    'data: {"id":"chatcmpl_2","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"content":"[[OPENCODE_TOOL]]\\n{\\"tool_calls\\":[{\\"name\\":\\"read\\",\\"arguments\\":{\\"filePath\\":\\"a.txt\\"}},{\\"name\\":\\"read\\",\\"arguments\\":{\\"filePath\\":\\"b.txt\\"}}]\\n[[/OPENCODE_TOOL]]"},"finish_reason":null}]}',
+    'data: {"id":"chatcmpl_2","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+    'data: [DONE]'
+  ].join("\n"));
+  const multiToolCompletion = buildChatCompletionFromBridge(multiToolTranscript);
+  assert.equal(multiToolCompletion.choices[0].finish_reason, "tool_calls");
+  assert.equal(multiToolCompletion.choices[0].message.tool_calls.length, 2);
+  assert.equal(multiToolCompletion.choices[0].message.tool_calls[0].function.name, "read");
+  assert.equal(multiToolCompletion.choices[0].message.tool_calls[1].function.name, "read");
+
   const ignoresReasoningMarkers = buildBridgeResultFromText(
     "Normal final text.",
     "[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"ignore.txt\",\"content\":\"x\"}}]}\n[[/OPENCODE_TOOL]]"
@@ -210,6 +224,11 @@ function run() {
   const sse = buildSSEFromBridge(transcript);
   assert.match(sse, /"finish_reason":"tool_calls"/);
   assert.match(sse, /"tool_calls"/);
+
+  const multiToolSse = buildSSEFromBridge(multiToolTranscript);
+  assert.match(multiToolSse, /"tool_calls"/);
+  assert.match(multiToolSse, /"index":0/);
+  assert.match(multiToolSse, /"index":1/);
 
   process.stdout.write("selftest ok\n");
 }
