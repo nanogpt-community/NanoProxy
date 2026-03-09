@@ -3,9 +3,11 @@
 const assert = require("node:assert/strict");
 const {
   buildBridgeResultFromText,
+  buildEmptyStopRecoveryRequest,
   buildChatCompletionFromBridge,
   buildSSEFromBridge,
   extractProgressiveToolCalls,
+  isEmptyBridgeStopAggregate,
   parseBridgeAssistantText,
   parseSSETranscript,
   transformRequestForBridge
@@ -128,6 +130,32 @@ function run() {
   });
   assert.match(requestWithTypedUserContent.rewritten.messages[2].content, /I want a pie recipe/);
   assert.match(requestWithTypedUserContent.rewritten.messages[2].content, /system-reminder/);
+
+  assert.equal(isEmptyBridgeStopAggregate({
+    reasoning: "",
+    content: "",
+    finishReason: "stop"
+  }), true);
+  assert.equal(isEmptyBridgeStopAggregate({
+    reasoning: "thinking",
+    content: "",
+    finishReason: "stop"
+  }), false);
+  assert.equal(isEmptyBridgeStopAggregate({
+    reasoning: "",
+    content: "done",
+    finishReason: "stop"
+  }), false);
+
+  const recoveryRequest = buildEmptyStopRecoveryRequest({
+    messages: [
+      { role: "system", content: "bridge" },
+      { role: "user", content: "make a game" }
+    ]
+  });
+  assert.equal(recoveryRequest.messages.at(-1).role, "user");
+  assert.match(recoveryRequest.messages.at(-1).content, /Your previous reply was empty/);
+  assert.match(recoveryRequest.messages.at(-1).content, /Do not return an empty response/);
 
   const parsedTool = parseBridgeAssistantText("```opencode-tool\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"hi\"}}]}\n```");
   assert.equal(parsedTool.kind, "tool_calls");

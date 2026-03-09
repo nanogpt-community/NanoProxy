@@ -456,6 +456,27 @@ function contentPartsToText(content) {
   return "";
 }
 
+function isEmptyBridgeStopAggregate(aggregate) {
+  if (!aggregate || aggregate.finishReason !== "stop") return false;
+  return !String(aggregate.reasoning || "").trim() && !String(aggregate.content || "").trim();
+}
+
+function buildEmptyStopRecoveryRequest(upstreamRequest) {
+  const rewritten = clone(upstreamRequest) || {};
+  const messages = Array.isArray(rewritten.messages) ? rewritten.messages.slice() : [];
+  messages.push({
+    role: "user",
+    content: [
+      "Your previous reply was empty.",
+      "Continue from the current task immediately.",
+      `Reply using ${TOOL_MODE_MARKER} ... ${TOOL_MODE_END_MARKER} or ${FINAL_MODE_MARKER} ... ${FINAL_MODE_END_MARKER}.`,
+      "Do not return an empty response."
+    ].join("\n")
+  });
+  rewritten.messages = messages;
+  return rewritten;
+}
+
 function encodeToolCallsBlock(toolCalls) {
   const callBlocks = toolCalls.map((call) => {
     const payload = {
@@ -1602,7 +1623,7 @@ async function proxyRequest(req, res) {
       emittedToolCalls = progressiveCalls.length;
     };
 
-    const aggregate = {
+    let aggregate = {
       id: null,
       model: null,
       created: null,
@@ -1612,28 +1633,62 @@ async function proxyRequest(req, res) {
       usage: undefined
     };
 
-    for await (const chunk of upstreamResponse.body) {
-      const textChunk = Buffer.from(chunk).toString("utf8");
-      appendTextLog(streamLogPath, textChunk);
-      rawBuffer += textChunk;
+    const consumeBridgeStream = async (response, logLabel) => {
+      rawBuffer = "";
+      for await (const chunk of response.body) {
+        const textChunk = Buffer.from(chunk).toString("utf8");
+        appendTextLog(streamLogPath, textChunk);
+        rawBuffer += textChunk;
 
-      let boundary;
-      while ((boundary = rawBuffer.indexOf("\n\n")) !== -1) {
-        const eventText = rawBuffer.slice(0, boundary);
-        rawBuffer = rawBuffer.slice(boundary + 2);
-        const line = eventText
-          .split(/\r?\n/)
-          .map((part) => part.trim())
-          .find((part) => part.startsWith("data:"));
-        if (!line) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
-        const parsed = tryParseJson(payload);
-        if (!parsed.ok) continue;
+        let boundary;
+        while ((boundary = rawBuffer.indexOf("\n\n")) !== -1) {
+          const eventText = rawBuffer.slice(0, boundary);
+          rawBuffer = rawBuffer.slice(boundary + 2);
+          const line = eventText
+            .split(/\r?\n/)
+            .map((part) => part.trim())
+            .find((part) => part.startsWith("data:"));
+          if (!line) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          const parsed = tryParseJson(payload);
+          if (!parsed.ok) continue;
 
-        applyChunkToAggregate(aggregate, parsed.value);
-        flushReasoningDelta(aggregate);
-        flushProgressiveToolCalls(aggregate);
+          applyChunkToAggregate(aggregate, parsed.value);
+          flushReasoningDelta(aggregate);
+          flushProgressiveToolCalls(aggregate);
+        }
+      }
+      appendActivity(`request.stream_consumed id=${requestId} label=${logLabel} finish=${aggregate.finishReason || "null"} reasoning_len=${aggregate.reasoning.length} content_len=${aggregate.content.length}`);
+    };
+
+    await consumeBridgeStream(upstreamResponse, "initial");
+
+    if (isEmptyBridgeStopAggregate(aggregate)) {
+      appendActivity(`request.empty_stop id=${requestId}`);
+      const recoveryRequest = buildEmptyStopRecoveryRequest(bridgeMeta.upstreamRequest);
+      const recoveryBuffer = Buffer.from(JSON.stringify(recoveryRequest), "utf8");
+      appendTextLog(streamLogPath, "\n# recovery-attempt=1\n");
+      const recoveryResponse = await fetch(upstreamUrl, {
+        method: req.method,
+        headers: buildUpstreamHeaders(req.headers, recoveryBuffer.length),
+        body: ["GET", "HEAD"].includes(req.method) ? undefined : recoveryBuffer
+      });
+      appendActivity(`request.recovery id=${requestId} status=${recoveryResponse.status}`);
+      if ((recoveryResponse.headers.get("content-type") || "").includes("text/event-stream")) {
+        aggregate = {
+          id: null,
+          model: null,
+          created: null,
+          reasoning: "",
+          content: "",
+          finishReason: null,
+          usage: undefined
+        };
+        await consumeBridgeStream(recoveryResponse, "recovery");
+      } else {
+        const recoveryText = await recoveryResponse.text();
+        appendTextLog(streamLogPath, recoveryText);
       }
     }
 
@@ -1812,9 +1867,11 @@ if (require.main === module) {
 
 module.exports = {
   buildBridgeResultFromText,
+  buildEmptyStopRecoveryRequest,
   buildChatCompletionFromBridge,
   buildSSEFromBridge,
   extractProgressiveToolCalls,
+  isEmptyBridgeStopAggregate,
   parseBridgeAssistantText,
   parseSSETranscript,
   transformRequestForBridge,
