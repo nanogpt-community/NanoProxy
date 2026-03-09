@@ -9,6 +9,10 @@ const path = require("node:path");
 const LISTEN_HOST = process.env.PROXY_HOST || "127.0.0.1";
 const LISTEN_PORT = Number(process.env.PROXY_PORT || "8787");
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || "https://nano-gpt.com/api/v1";
+const DEBUG_FLAG_FILE = path.join(__dirname, ".debug-logging");
+const ENABLE_DEBUG_LOGS = process.env.NANO_PROXY_DEBUG === "1" || fs.existsSync(DEBUG_FLAG_FILE);
+const LOG_DIR = path.join(__dirname, "Logs");
+const ACTIVITY_LOG = path.join(LOG_DIR, "activity.log");
 const TOOL_BLOCK_LABEL = "opencode-tool";
 const FINAL_BLOCK_LABEL = "opencode-final";
 const TOOL_RESULT_LABEL = "opencode-tool-result";
@@ -37,17 +41,21 @@ function ensureDir(dir) {
 }
 
 function appendActivity(line) {
-  void line;
+  if (!ENABLE_DEBUG_LOGS) return;
+  ensureDir(LOG_DIR);
+  fs.appendFileSync(ACTIVITY_LOG, `${new Date().toISOString()} ${line}\n`, "utf8");
 }
 
 function writeJsonLog(filePath, payload) {
-  void filePath;
-  void payload;
+  if (!ENABLE_DEBUG_LOGS) return;
+  ensureDir(path.dirname(filePath));
+  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
 }
 
 function appendTextLog(filePath, text) {
-  void filePath;
-  void text;
+  if (!ENABLE_DEBUG_LOGS) return;
+  ensureDir(path.dirname(filePath));
+  fs.appendFileSync(filePath, text, "utf8");
 }
 
 function nowStamp() {
@@ -1204,6 +1212,7 @@ function copyResponseHeaders(upstreamHeaders, res, bodyLength) {
 async function proxyRequest(req, res) {
   const requestId = `${nowStamp()}-${randomUUID().slice(0, 8)}`;
   const upstreamUrl = buildUpstreamUrl(req.url);
+  const streamLogPath = path.join(LOG_DIR, `${requestId}-stream.sse`);
   const reqBuffer = await readRequestBody(req);
   const reqText = reqBuffer.toString("utf8");
   const reqParsed = tryParseJson(reqText);
@@ -1239,7 +1248,7 @@ async function proxyRequest(req, res) {
     requestLog.requestBodyOriginalText = reqText;
   }
 
-  writeJsonLog("", requestLog);
+  writeJsonLog(path.join(LOG_DIR, `${requestId}-request.json`), requestLog);
 
   const upstreamResponse = await fetch(upstreamUrl, {
     method: req.method,
@@ -1250,16 +1259,28 @@ async function proxyRequest(req, res) {
   const contentType = upstreamResponse.headers.get("content-type") || "";
   if (contentType.includes("text/event-stream")) {
     appendActivity(`request.stream_buffered id=${requestId} status=${upstreamResponse.status}`);
+    appendTextLog(
+      streamLogPath,
+      [
+        `# request_id=${requestId}`,
+        `# time=${new Date().toISOString()}`,
+        `# path=${req.url}`,
+        `# upstream=${upstreamUrl}`,
+        `# status=${upstreamResponse.status}`,
+        ""
+      ].join("\n")
+    );
 
     if (!(bridgeMeta && bridgeMeta.bridgeApplied)) {
       const streamText = await upstreamResponse.text();
+      appendTextLog(streamLogPath, streamText);
       res.setHeader("content-type", "text/event-stream; charset=utf-8");
       res.setHeader("cache-control", "no-cache");
       res.setHeader("connection", "keep-alive");
       res.setHeader("content-length", Buffer.byteLength(streamText));
       res.writeHead(upstreamResponse.status);
       res.end(streamText);
-      appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_passthrough`);
+      appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_passthrough stream_log=${path.basename(streamLogPath)}`);
       return;
     }
 
@@ -1310,6 +1331,7 @@ async function proxyRequest(req, res) {
 
     for await (const chunk of upstreamResponse.body) {
       const textChunk = Buffer.from(chunk).toString("utf8");
+      appendTextLog(streamLogPath, textChunk);
       rawBuffer += textChunk;
 
       let boundary;
@@ -1354,7 +1376,7 @@ async function proxyRequest(req, res) {
       }));
       res.write("data: [DONE]\n\n");
       res.end();
-      appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_bridge_partial`);
+      appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_bridge_partial stream_log=${path.basename(streamLogPath)}`);
       return;
     }
 
@@ -1389,7 +1411,7 @@ async function proxyRequest(req, res) {
     }));
     res.write("data: [DONE]\n\n");
     res.end();
-    appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_bridge_reasoning`);
+    appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_bridge_reasoning stream_log=${path.basename(streamLogPath)}`);
     return;
   }
 
@@ -1431,7 +1453,7 @@ async function proxyRequest(req, res) {
     responseLog.responseBodyOriginalText = responseText;
   }
 
-  writeJsonLog("", responseLog);
+  writeJsonLog(path.join(LOG_DIR, `${requestId}-response.json`), responseLog);
   appendActivity(`request.done id=${requestId} status=${upstreamResponse.status}`);
 
   copyResponseHeaders(upstreamResponse.headers, res, Buffer.byteLength(finalText));
@@ -1445,6 +1467,8 @@ async function requestHandler(req, res) {
       const payload = JSON.stringify({
         ok: true,
         upstream: UPSTREAM_BASE_URL,
+        debugLogs: ENABLE_DEBUG_LOGS,
+        ...(ENABLE_DEBUG_LOGS ? { logDir: LOG_DIR } : {}),
         toolBridgeMode: BRIDGE_MODE
       });
       res.writeHead(200, {

@@ -48,6 +48,38 @@ node server.js
 
 You only need those environment variables if you want to change the defaults. Normally, `node server.js` is enough.
 
+## Optional Debug Logging
+
+Logging is off by default.
+
+You can enable it temporarily with an environment variable:
+
+```powershell
+$env:NANO_PROXY_DEBUG = "1"
+node server.js
+```
+
+Or toggle it persistently inside the proxy folder:
+
+```powershell
+.\toggle-debug.ps1
+```
+
+Run `.\toggle-debug.ps1` again to turn it back off.
+
+When enabled, logs are written to:
+
+```text
+Logs/
+```
+
+That folder will contain:
+
+- `activity.log`
+- `*-request.json`
+- `*-stream.sse`
+- `*-response.json`
+
 Health check:
 
 ```powershell
@@ -89,7 +121,7 @@ done
 - This means reliability is prioritized over raw token-by-token passthrough for tool turns.
 - Requests without `tools` are forwarded normally.
 - For bridged tool turns, the proxy caps upstream `temperature` and `top_p` to reduce protocol drift.
-- This share version does not write request or stream logs.
+- Debug logging is optional and off by default.
 - This proxy currently targets OpenAI-compatible `chat/completions` style tool clients.
 
 ## Verification
