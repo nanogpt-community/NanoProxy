@@ -1,10 +1,46 @@
 {
-  "name": "opencode-nanogpt-tool-bridge",
+  "name": "nanoproxy",
   "private": false,
-  "version": "1.0.0",
-  "description": "Local OpenAI-compatible proxy that bridges OpenCode tool calls for NanoGPT when native tool calling is unreliable.",
+  "version": "1.1.0",
+  "description": "Local OpenAI-compatible proxy and OpenCode plugin that bridges tool calls for NanoGPT when native tool calling is unreliable.",
+  "type": "commonjs",
+  "main": "src/plugin.mjs",
+  "exports": {
+    ".": "./server.js",
+    "./plugin": "./src/plugin.mjs",
+    "./core": "./src/core.js"
+  },
+  "types": "./dist/plugin.d.ts",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node selftest.js"
+    "check": "node --check server.js && node selftest.js",
+    "build": "tsc src/plugin.ts --declaration --emitDeclarationOnly --declarationDir dist --moduleResolution node --target ES2022 --module ESNext --esModuleInterop",
+    "typecheck": "tsc --noEmit src/plugin.ts"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.1.0",
+    "zod": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "nanogpt",
+    "tool-bridge",
+    "proxy",
+    "llm",
+    "ai"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nanogpt-community/NanoProxy"
   }
 }

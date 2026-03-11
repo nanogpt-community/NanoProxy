@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY package.json ./
 COPY server.js ./
+COPY src/ ./src/
 COPY selftest.js ./
 COPY toggle-debug.ps1 ./
 
