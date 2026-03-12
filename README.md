@@ -1,46 +1,48 @@
 # NanoProxy
 
-Local OpenAI-compatible proxy and OpenCode plugin for NanoGPT when native tool calling is unreliable.
+NanoProxy is a bridge layer for NanoGPT when native tool calling is unreliable.
 
-## What it does
+It sits between the client and NanoGPT, replaces fragile native tool-calling with a stricter bridge protocol, and converts the result back into normal OpenAI-style `tool_calls` for the client. That lets tools like OpenCode keep working normally even when NanoGPT would otherwise stop early, leak raw tool text, or return malformed tool output.
 
-- The client sends normal OpenAI-style `tools`
-- NanoProxy strips native tool calling before forwarding upstream
-- The model is given a strict text-based tool protocol instead
-- NanoProxy converts the model's text responses back into normal OpenAI-style `tool_calls` for the client
+## Which mode should I use?
 
-So the client still sees standard tool calls, but NanoGPT does not have to rely on its native tool-calling behavior.
+### Use the plugin if you use OpenCode
+This is the easiest setup for OpenCode.
 
-## Usage Modes
+- No local proxy server to keep running
+- No custom provider setup
+- Keep using the normal built-in NanoGPT provider
 
-### 1. Standalone Server Mode (recommended)
+### Use the standalone server for other tools
+Use this if:
 
-Run as a local HTTP proxy that sits between your client and NanoGPT.
+- you are not using OpenCode
+- your client supports an OpenAI-compatible base URL
+- you prefer a separate local proxy process
 
-```sh
-node server.js
-```
+## Quick Start
 
-The proxy listens on `http://127.0.0.1:8787` by default.
+### OpenCode users: Plugin mode (recommended)
 
-In OpenCode, create a custom OpenAI-compatible provider pointing to `http://127.0.0.1:8787` with your NanoGPT API key. Do not use the built-in NanoGPT provider alongside the proxy.
+- Add the plugin entry shown in [OpenCode Plugin Setup](#opencode-plugin-setup)
+- Restart OpenCode
+- Keep using the normal built-in NanoGPT provider
 
-#### Environment Variables
+You do not need to run `server.js` for plugin mode.
 
-```sh
-UPSTREAM_BASE_URL=https://nano-gpt.com/api/v1
-PROXY_HOST=127.0.0.1
-PROXY_PORT=8787
-node server.js
-```
+### Other tools: Standalone server mode
 
-### 2. OpenCode Plugin Mode (experimental)
+- Start the proxy with `node server.js`
+- Point your client to `http://127.0.0.1:8787`
+- Use your normal NanoGPT API key in that client
 
-> **Warning**: This mode is experimental. The standalone server mode is more battle-tested and recommended for production use.
+Full details are in [Standalone Server Setup](#standalone-server-setup).
 
-The plugin patches `globalThis.fetch` inside the OpenCode process, intercepting NanoGPT API calls transparently. No separate server process needed.
+## OpenCode Plugin Setup
 
-Add NanoProxy to your OpenCode configuration (`~/.config/opencode/opencode.json`):
+The plugin intercepts NanoGPT API requests inside OpenCode and applies the NanoProxy bridge automatically.
+
+Example config:
 
 ```json
 {
@@ -50,81 +52,107 @@ Add NanoProxy to your OpenCode configuration (`~/.config/opencode/opencode.json`
 }
 ```
 
-The plugin automatically detects requests to `nano-gpt.com`, applies the bridge transformation, and converts responses back to native `tool_calls` before the AI SDK ever sees them.
+Notes:
+- Use a real absolute file path.
+- On Windows, a valid example looks like:
+  - `file:///C:/Users/you/path/to/NanoProxy/src/plugin.mjs`
+- After editing the config, restart OpenCode.
 
-Streaming is handled progressively: reasoning content streams live, and tool calls are emitted as individual deltas when complete envelopes are detected.
+### Plugin debug logging
+
+Enable debug logging when starting OpenCode:
+
+```sh
+NANOPROXY_DEBUG=1 opencode
+```
+
+Optional:
+- set `NANOPROXY_LOG=/path/to/file` to change the log file location
+
+## Standalone Server Setup
+
+Run the standalone proxy:
+
+```sh
+node server.js
+```
+
+Default address:
+
+```text
+http://127.0.0.1:8787
+```
+
+Optional environment variables:
+
+```sh
+UPSTREAM_BASE_URL=https://nano-gpt.com/api/v1
+PROXY_HOST=127.0.0.1
+PROXY_PORT=8787
+node server.js
+```
+
+### Server debug logging
+
+Off by default.
+
+Enable for one run:
+
+```sh
+NANO_PROXY_DEBUG=1 node server.js
+```
+
+Or toggle persistently on Windows:
+
+```sh
+./toggle-debug.ps1
+```
+
+Logs are written to `Logs/`.
+
+### Health check
+
+```sh
+curl http://127.0.0.1:8787/health
+```
 
 ## Docker
 
-If you do not want to run Node directly, you can run the proxy in Docker instead.
-
-Build and run with Docker:
+If you want to run the standalone server in Docker instead of running Node directly:
 
 ```sh
 docker build -t nano-proxy .
 docker run --rm -p 8787:8787 nano-proxy
 ```
 
-Or use Docker Compose:
+Or with Compose:
 
 ```sh
 docker compose up --build
 ```
 
-This starts the proxy on:
+This still exposes the proxy at:
 
 ```text
 http://127.0.0.1:8787
 ```
 
-The OpenCode setup stays the same:
-
-1. Create a custom OpenAI-compatible provider.
-2. Point it to `http://127.0.0.1:8787`.
-3. Put your NanoGPT API key on that custom provider.
-
-#### Debug Logging (Server Mode)
-
-Off by default. Enable with:
-
-```sh
-NANO_PROXY_DEBUG=1 node server.js
-```
-
-Or toggle persistently:
-
-```sh
-./toggle-debug.ps1
-```
-
-Logs are written to `Logs/` and include `activity.log`, per-request `*-request.json`, `*-stream.sse`, and `*-response.json`.
-
-#### Debug Logging (Plugin Mode)
-
-```sh
-NANOPROXY_DEBUG=1 opencode
-```
-
-Events are appended to `/tmp/nanoproxy-plugin.log` as newline-delimited JSON. Override the path with `NANOPROXY_LOG=/path/to/file`.
-
-#### Health Check
-
-```sh
-curl http://127.0.0.1:8787/health
-```
-
-## How the Bridge Works
+## What NanoProxy actually does
 
 For tool-enabled requests:
 
-1. NanoProxy removes native `tools`, `tool_choice`, and `parallel_tool_calls` before sending upstream.
-2. A strict tool protocol is injected into the system prompt.
-3. A short protocol reminder is appended to each user turn.
-4. The model must respond using one of two marker envelopes:
+1. It removes the normal native tool-calling structure before sending the request upstream.
+2. It tells the model to use a stricter text-based tool format instead.
+3. It watches the model output.
+4. It converts that output back into normal OpenAI-style `tool_calls`.
 
-**Tool use:**
+So your client still sees normal tool calls, but NanoGPT does not have to rely on its native tool-calling behavior.
 
-```
+## Bridge format
+
+Tool reply:
+
+```text
 [[OPENCODE_TOOL]]
 [[CALL]]
 {"name": "read", "arguments": {"filePath": "src/app.js"}}
@@ -132,9 +160,9 @@ For tool-enabled requests:
 [[/OPENCODE_TOOL]]
 ```
 
-**Multiple independent tool calls in one turn:**
+Multiple independent tool calls in one turn:
 
-```
+```text
 [[OPENCODE_TOOL]]
 [[CALL]]
 {"name": "read", "arguments": {"filePath": "src/app.js"}}
@@ -145,34 +173,56 @@ For tool-enabled requests:
 [[/OPENCODE_TOOL]]
 ```
 
-**Final answer:**
+Final answer:
 
-```
+```text
 [[OPENCODE_FINAL]]
 Your answer here.
 [[/OPENCODE_FINAL]]
 ```
 
-5. NanoProxy parses the envelope and converts it into OpenAI-style `tool_calls`.
-
 ## Notes
 
-- Requests without `tools` are forwarded unchanged.
-- Temperature and `top_p` are capped for bridged requests to reduce protocol drift.
-- Up to 5 parallel tool calls per turn are supported.
-- Reasoning streams through live; tool and final content are buffered until fully classifiable.
-- Tool history (previous `tool_calls` / `tool` messages) is re-encoded into text protocol before each upstream call.
+- Requests without tools are forwarded unchanged.
+- Reasoning streams live.
+- Tool and final content are buffered until NanoProxy can classify them safely.
+- Up to 5 parallel tool calls per turn are supported for models that behave well with batching.
+- Some models may still behave better with one tool call per turn.
+
+## Troubleshooting
+
+### OpenCode says the config file is invalid JSON
+- Make sure the config file is valid JSON or JSONC.
+- On Windows, avoid saving it with weird encoding or a BOM if OpenCode rejects it.
+
+### Plugin seems to do nothing
+- Check that the plugin path is correct.
+- Make sure it is a `file:///...` URL, not a normal path string.
+- Restart OpenCode after editing the config.
+- If needed, enable `NANOPROXY_DEBUG=1` and check the plugin log output.
+
+### Tool text leaks into the chat
+- This usually means the model drifted into a malformed tool format.
+- Try again once first.
+- If it keeps happening, enable debug logs and inspect what the model actually emitted.
+
+### Standalone server does not respond
+- Make sure `node server.js` is still running.
+- Check `http://127.0.0.1:8787/health`.
 
 ## Project Structure
 
-```
+```text
 NanoProxy/
-├── server.js        # Standalone HTTP proxy server
-├── src/
-│   ├── core.js      # Shared bridge transformation logic
-│   └── plugin.mjs   # OpenCode plugin (fetch interceptor)
-├── selftest.js      # Test suite
-└── package.json
+|-- server.js
+|-- src/
+|   |-- core.js
+|   `-- plugin.mjs
+|-- selftest.js
+|-- README.md
+|-- package.json
+|-- Dockerfile
+`-- docker-compose.yml
 ```
 
 ## Verification
