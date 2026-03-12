@@ -45,6 +45,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx) {
   const applyChunkToAggregate = core.applyChunkToAggregate
   const extractProgressiveToolCalls = core.extractProgressiveToolCalls
   const extractStreamableFinalContent = core.extractStreamableFinalContent
+  const MAX_TOOL_CALLS_PER_TURN = core.MAX_TOOL_CALLS_PER_TURN
 
   if (typeof requestNeedsBridge !== "function" || typeof transformRequestForBridge !== "function") {
     return {}
@@ -163,7 +164,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx) {
     const flushProgressiveToolCallsFunc = async () => {
       const calls = extractProgressiveToolCalls(aggregate.content)
       if (calls.length <= emittedToolCallCount) return
-      dbg({ ...dbgData, event: "stream_progressive_calls", total: calls.length, new: calls.length - emittedToolCallCount })
+      dbg({ ...dbgData, event: "stream_progressive_calls", total: calls.length, new: calls.length - emittedToolCallCount, source: "content" })
       for (let i = emittedToolCallCount; i < calls.length; i++) {
         const call = calls[i]
         await writer.write(encoder.encode(sseLine({
@@ -188,7 +189,21 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx) {
       emittedToolCallCount = calls.length
     }
 
+    const finalizeAsToolCalls = async () => {
+      await writer.write(encoder.encode(sseLine({
+        id: aggregate.id || `chatcmpl_${generateToolCallId()}`,
+        object: "chat.completion.chunk",
+        created: aggregate.created || Math.floor(Date.now() / 1000),
+        model: aggregate.model || "tool-bridge",
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        ...(aggregate.usage ? { usage: aggregate.usage } : {})
+      })))
+      await writer.write(encoder.encode("data: [DONE]\n\n"))
+      await writer.close()
+    }
+
     ;(async () => {
+      let cappedAtToolLimit = false
       try {
         while (true) {
           const { done, value } = await reader.read()
@@ -284,7 +299,17 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx) {
             applyChunkToAggregate(aggregate, parsed.value)
             await flushReasoningDelta()
             await flushProgressiveToolCallsFunc()
+            if (emittedToolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
+              cappedAtToolLimit = true
+              dbg({ ...dbgData, event: "stream_tool_call_cap", count: emittedToolCallCount })
+              try { await reader.cancel() } catch (e) {}
+              break
+            }
             await flushFinalContentDelta()
+          }
+          if (cappedAtToolLimit) {
+            await finalizeAsToolCalls()
+            break
           }
         }
       } catch (err) {
