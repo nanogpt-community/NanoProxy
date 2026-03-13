@@ -231,27 +231,6 @@ Your answer here.
 - By default, NanoProxy allows up to 5 tool calls in a single assistant turn for models that behave well with batching.
 - Some models may still behave better with one tool call per turn.
 
-## Troubleshooting
-
-### OpenCode says the config file is invalid JSON
-- Make sure the config file is valid JSON or JSONC.
-- On Windows, avoid saving it with weird encoding or a BOM if OpenCode rejects it.
-
-### Plugin seems to do nothing
-- Check that the plugin path is correct.
-- Make sure it is a `file:///...` URL, not a normal path string.
-- Restart OpenCode after editing the config.
-- If needed, enable `NANOPROXY_DEBUG=1` and check the plugin log output.
-
-### Tool text leaks into the chat
-- This usually means the model drifted into a malformed tool format.
-- Try again once first.
-- If it keeps happening, enable debug logs and inspect what the model actually emitted.
-
-### Standalone server does not respond
-- Make sure `node server.js` is still running.
-- Check `http://127.0.0.1:8787/health`.
-
 ## Project Structure
 
 ```text
