@@ -670,12 +670,12 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
   const callExample = flavor === "kimi"
     ? { tool_name: "tool_name", tool_input: { example: true } }
     : { name: "tool_name", arguments: { example: true } };
-  const validReadExample = flavor === "kimi"
-    ? { tool_name: "tool_name", tool_input: { filePath: "src/app.js" } }
-    : { name: "read", arguments: { filePath: "src/app.js" } };
-  const validReadExample2 = flavor === "kimi"
-    ? { tool_name: "tool_name", tool_input: { filePath: "src/styles.css" } }
-    : { name: "read", arguments: { filePath: "src/styles.css" } };
+  const validCallExample = flavor === "kimi"
+    ? { tool_name: "tool_name", tool_input: { example: true } }
+    : { name: "tool_name", arguments: { example: true } };
+  const validCallExample2 = flavor === "kimi"
+    ? { tool_name: "tool_name", tool_input: { another_example: true } }
+    : { name: "tool_name", arguments: { another_example: true } };
   const callCountRule = isSingleCallFlavor(flavor)
     ? "- Emit exactly one CALL block per tool reply."
     : `- You may batch up to ${MAX_TOOL_CALLS_PER_TURN} independent tool calls per reply. Never emit more than ${MAX_TOOL_CALLS_PER_TURN} CALL blocks. If you need more than ${MAX_TOOL_CALLS_PER_TURN}, do the first ${MAX_TOOL_CALLS_PER_TURN} now and continue after results arrive.`;
@@ -707,6 +707,7 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
     "- Do not write any explanatory prose before, inside, or after the tool envelope.",
     "- Do not use legacy bracketed formats like [toolname].",
     "- Do not output raw tool_calls JSON unless recovery is needed; CALL blocks are the required format.",
+    "- Never invent tool names. Use one of the listed tool names exactly as provided.",
     flavor === "kimi"
       ? "- For Kimi, each CALL JSON object must use tool_name and tool_input. Do not use name/arguments."
       : "- Each CALL JSON object must use name and arguments. Do not use tool_name/tool_input.",
@@ -734,17 +735,17 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
     "Valid response example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    JSON.stringify(validReadExample, null, 2),
+    JSON.stringify(validCallExample, null, 2),
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
     ...(!isSingleCallFlavor(flavor) ? [
       "Valid multi-tool example:",
       TOOL_MODE_MARKER,
       CALL_MODE_MARKER,
-      JSON.stringify(validReadExample, null, 2),
+      JSON.stringify(validCallExample, null, 2),
       CALL_MODE_END_MARKER,
       CALL_MODE_MARKER,
-      JSON.stringify(validReadExample2, null, 2),
+      JSON.stringify(validCallExample2, null, 2),
       CALL_MODE_END_MARKER,
       TOOL_MODE_END_MARKER
     ] : []),
@@ -1942,4 +1943,5 @@ module.exports = {
   // Clone utility
   clone
 };
+
 
