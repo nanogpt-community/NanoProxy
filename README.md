@@ -197,7 +197,7 @@ Tool reply:
 ```text
 [[OPENCODE_TOOL]]
 [[CALL]]
-{"name": "read", "arguments": {"filePath": "src/app.js"}}
+{"name": "tool_name", "arguments": {"example": true}}
 [[/CALL]]
 [[/OPENCODE_TOOL]]
 ```
@@ -207,10 +207,10 @@ Multiple independent tool calls in one turn:
 ```text
 [[OPENCODE_TOOL]]
 [[CALL]]
-{"name": "read", "arguments": {"filePath": "src/app.js"}}
+{"name": "tool_name", "arguments": {"example": true}}
 [[/CALL]]
 [[CALL]]
-{"name": "read", "arguments": {"filePath": "src/styles.css"}}
+{"name": "tool_name", "arguments": {"another_example": true}}
 [[/CALL]]
 [[/OPENCODE_TOOL]]
 ```
@@ -256,5 +256,6 @@ node selftest.js
 ## License
 
 MIT
+
 
 
