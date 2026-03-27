@@ -6,7 +6,7 @@ It supports both:
 - an OpenCode plugin
 - a standalone local server for OpenAI-compatible tools such as Roo Code, Kilo Code, Zed, Cline-style clients, and similar editors or agents
 
-By default NanoProxy uses an object bridge that asks the upstream model to emit one structured JSON turn object inside normal content. NanoProxy incrementally parses that object and converts it back into native client fields. A legacy XML bridge is still available when needed.
+By default NanoProxy uses an object bridge that asks the upstream model to emit one structured JSON turn object inside normal content. NanoProxy incrementally parses that object and converts it back into native client fields. An XML bridge is also available as an alternative protocol when needed.
 
 It also supports optional native-first fallback for selected models through `BRIDGE_MODELS`.
 
@@ -57,14 +57,30 @@ When the provider exposes reasoning separately, NanoProxy passes that through se
 
 ### XML bridge
 
-The XML bridge is still supported as a legacy fallback:
+The XML bridge is also available as an alternative protocol:
 
 ```powershell
 $env:BRIDGE_PROTOCOL = "xml"
 node server.js
 ```
 
-If you need it, NanoProxy can still rewrite tool-enabled requests into the older XML-style bridge and convert the result back into standard `tool_calls`.
+In XML mode, NanoProxy asks the model to emit tool actions in a narrow XML format inside normal content.
+
+Example:
+
+```xml
+<open>I will inspect the relevant files now.</open>
+<read>
+  <path>src/index.js</path>
+</read>
+```
+
+How it works:
+- `<open>...</open>` carries visible user-facing text
+- tool calls are emitted as XML tags named after the tool
+- tool arguments are passed as child tags inside the tool tag
+- NanoProxy parses those XML tool calls incrementally and converts them back into standard OpenAI-style `tool_calls`
+- when batching is allowed, multiple tool tags can appear in the same response
 
 ## BRIDGE_PROTOCOL
 
@@ -72,7 +88,7 @@ If you need it, NanoProxy can still rewrite tool-enabled requests into the older
 
 - not set: use `object`
 - `object`: use the object bridge
-- `xml`: use the legacy XML bridge
+- `xml`: use the XML bridge
 
 Examples:
 
@@ -271,7 +287,7 @@ Compose uses the same environment model as the server, so you can add values lik
 Key behavior:
 - bridge activates only for tool-enabled requests
 - requests without tools pass through unchanged
-- object bridge is the default and XML remains available as a fallback protocol
+- object bridge is the default and the XML bridge remains available as an alternative protocol
 - bridged output is converted back into normal OpenAI-style response fields
 - invalid empty bridged turns are treated as protocol failures, not silent successes
 - NanoProxy performs one retry for the specific invalid-empty bridged-turn case: no visible content and no tool call
@@ -310,3 +326,6 @@ Or:
 ```sh
 npm run check
 ```
+
+
+
