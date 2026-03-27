@@ -1,699 +1,776 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const core = require("./src/core");
-const {
-  buildBridgeResultFromText,
-  buildEmptyStopRecoveryRequest,
-  buildChatCompletionFromBridge,
-  buildSSEFromBridge,
-  extractProgressiveToolCalls,
-  isEmptyBridgeStopAggregate,
-  parseBridgeAssistantText,
-  parseSSETranscript,
-  transformRequestForBridge
-} = require("./server");
+process.env.BRIDGE_PROTOCOL = 'xml';
 
-function run() {
-  const request = transformRequestForBridge({
-    model: "zai-org/glm-5:thinking",
-    tool_choice: "auto",
-    tools: [
-      {
-        name: "write",
-        description: "Write a file",
-        parameters: {
-          type: "object",
-          properties: {
-            filePath: { type: "string" },
-            content: { type: "string" }
-          },
-          required: ["filePath", "content"]
-        }
-      }
-    ],
-    messages: [
-      { role: "system", content: "system prompt" },
-      { role: "user", content: "create a file" }
-    ]
-  });
+const core = require("./src/core.js");
 
-  assert.equal(request.bridgeApplied, true);
-  assert.equal(Array.isArray(request.rewritten.tools), false);
-  assert.equal(request.rewritten.messages[1].role, "system");
-  assert.match(request.rewritten.messages[1].content, /\[\[OPENCODE_TOOL\]\]/);
-  assert.match(request.rewritten.messages[1].content, /\[\[\/OPENCODE_TOOL\]\]/);
-  assert.match(request.rewritten.messages[1].content, /\[\[CALL\]\]/);
-  assert.match(request.rewritten.messages[1].content, /\[\[\/CALL\]\]/);
-  assert.match(request.rewritten.messages[1].content, /Invalid response example/);
-  assert.match(request.rewritten.messages[1].content, /Only two reply formats are valid/);
-  assert.match(request.rewritten.messages[1].content, /Do not use legacy bracketed formats/);
-  assert.match(request.rewritten.messages[1].content, /use the appropriate clarification tool instead of inventing requirements/);
-  assert.match(request.rewritten.messages[1].content, /\[question\] \{ \.\.\. \}/);
-  assert.equal(request.rewritten.temperature, 0.2);
-  assert.equal(request.rewritten.top_p, 0.3);
-  assert.equal(request.rewritten.messages[2].role, "user");
-  assert.match(request.rewritten.messages[2].content, /Protocol requirements for your next reply/);
-  assert.match(request.rewritten.messages[2].content, /prefer the appropriate clarification tool instead of guessing/);
-  assert.match(request.rewritten.messages[2].content, /Do not use \[question\], \[write\], \[read\]/);
-  assert.match(request.rewritten.messages[2].content, /concrete task/);
-  assert.match(request.rewritten.messages[2].content, /generic greeting or conversation opener/);
-  assert.match(request.rewritten.messages[2].content, /oldString with enough unique surrounding context/);
-  assert.match(request.rewritten.messages[1].content, /oldString must be unique in the target file/);
-
-  const kimiRequest = transformRequestForBridge({
-    model: "moonshotai/kimi-k2.5:thinking",
-    tools: [
-      {
-        name: "write",
-        description: "Write a file",
-        parameters: {
-          type: "object",
-          properties: {
-            filePath: { type: "string" },
-            content: { type: "string" }
-          },
-          required: ["filePath", "content"]
-        }
-      }
-    ],
-    messages: [
-      { role: "user", content: "create a file" }
-    ]
-  });
-  assert.match(kimiRequest.rewritten.messages[0].content, /Emit exactly one CALL block per tool reply/);
-  assert.match(kimiRequest.rewritten.messages[0].content, /Do not emit \[\[CALL\]\] without first emitting \[\[OPENCODE_TOOL\]\]/);
-  assert.match(kimiRequest.rewritten.messages[0].content, /Each CALL JSON object must use name and arguments/);
-  assert.doesNotMatch(kimiRequest.rewritten.messages[0].content, /tool_name/);
-  assert.doesNotMatch(kimiRequest.rewritten.messages[0].content, /tool_input/);
-  assert.doesNotMatch(kimiRequest.rewritten.messages[0].content, /Valid multi-tool example/);
-  assert.match(kimiRequest.rewritten.messages[1].content, /Do not output a second \[\[CALL\]\] until the first tool result comes back/);
-
-  const zedLikeRequest = transformRequestForBridge({
-    model: "zai-org/glm-5:thinking",
-    tools: [
-      {
+// ---- Test: transformRequestForXmlBridge ----
+(function testTransformRequestForXmlBridge() {
+  const body = {
+    model: "test-model",
+    messages: [{ role: "user", content: "Fix the failing test" }],
+    tools: [{
+      type: "function",
+      function: {
         name: "edit_file",
         description: "Edit a file",
         parameters: {
           type: "object",
           properties: {
-            display_description: { type: "string" },
-            path: { type: "string" },
-            mode: { type: "string", enum: ["edit", "create", "overwrite"] }
+            filePath: { type: "string", description: "Path" },
+            newString: { type: "string", description: "Replacement" }
           },
-          required: ["display_description", "path", "mode"]
+          required: ["filePath", "newString"]
         }
       }
-    ],
-    messages: [
-      { role: "user", content: "create a file" }
-    ]
-  });
-  assert.doesNotMatch(zedLikeRequest.rewritten.messages[1].content, /content_b64/);
-  assert.doesNotMatch(zedLikeRequest.rewritten.messages[1].content, /oldString_b64/);
-  assert.doesNotMatch(zedLikeRequest.rewritten.messages[1].content, /newString_b64/);
-  assert.match(zedLikeRequest.rewritten.messages[1].content, /workspace-relative paths/);
+    }]
+  };
+  const transformed = core.transformRequestForXmlBridge(body);
+  assert.equal(transformed.bridgeApplied, true);
+  assert.equal(Array.isArray(transformed.rewritten.tools), false);
+  assert.deepEqual(transformed.toolNames, ["edit_file"]);
+  // System prompt should show the tool-name-as-tag format
+  assert.match(transformed.rewritten.messages[0].content, /<edit_file>/);
+  assert.match(transformed.rewritten.messages[0].content, /<filePath>/);
+  assert.match(transformed.rewritten.messages[0].content, /<\/edit_file>/);
+  assert.match(transformed.rewritten.messages[0].content, /<open>I will use edit_file now\.<\/open>/);
+  assert.match(transformed.rewritten.messages[0].content, /begin with a brief user-facing line inside <open>/);
+  assert.match(transformed.rewritten.messages[0].content, /Never return an empty tool-enabled response/);
+  console.log("  PASS: transformRequestForXmlBridge");
+})();
 
-  const opencodeLikeRequest = transformRequestForBridge({
-    model: "zai-org/glm-5:thinking",
+// ---- Test: parallel requests get a batched example in the prompt ----
+(function testParallelPromptExample() {
+  const body = {
+    model: "test-model",
+    parallel_tool_calls: true,
+    messages: [{ role: "user", content: "Check both files" }],
     tools: [
       {
-        name: "write",
-        description: "Write a file",
-        parameters: {
-          type: "object",
-          properties: {
-            filePath: { type: "string" },
-            content: { type: "string" }
-          },
-          required: ["filePath", "content"]
+        type: "function",
+        function: {
+          name: "read_file",
+          description: "Read a file",
+          parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
         }
       },
       {
-        name: "bash",
-        description: "Run shell commands",
-        parameters: {
-          type: "object",
-          properties: {
-            command: { type: "string" },
-            description: { type: "string" }
-          },
-          required: ["command", "description"]
+        type: "function",
+        function: {
+          name: "search_files",
+          description: "Search files",
+          parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
         }
       }
-    ],
-    messages: [
-      { role: "user", content: "create a file" }
     ]
-  });
-  assert.match(opencodeLikeRequest.rewritten.messages[0].content, /content_b64/);
-  assert.match(opencodeLikeRequest.rewritten.messages[0].content, /command_b64/);
-  assert.match(opencodeLikeRequest.rewritten.messages[1].content, /content_b64/);
-  assert.match(opencodeLikeRequest.rewritten.messages[1].content, /command_b64/);
-
-  const requestWithToolResult = transformRequestForBridge({
-    model: "zai-org/glm-5:thinking",
-    tools: [
-      {
-        name: "write",
-        description: "Write a file",
-        parameters: { type: "object", properties: { filePath: { type: "string" } } }
-      }
-    ],
-    messages: [
-      { role: "user", content: "do it" },
-      {
-        role: "tool",
-        tool_call_id: "call_123",
-        content: "Wrote file successfully."
-      }
-    ]
-  });
-  const bridgedToolResultMessage = requestWithToolResult.rewritten.messages.find((msg) => msg.role === "user" && /opencode-tool-result/.test(msg.content || ""));
-  assert.ok(bridgedToolResultMessage);
-  assert.match(bridgedToolResultMessage.content, /Your next reply must be exactly one envelope/);
-  assert.match(bridgedToolResultMessage.content, /Do not narrate the next step in plain text/);
-  assert.match(bridgedToolResultMessage.content, /multiple CALL blocks/);
-  assert.match(bridgedToolResultMessage.content, /Do not use legacy forms like \[question\]/);
-  assert.match(bridgedToolResultMessage.content, /prefer the appropriate clarification tool instead of guessing/);
-  assert.match(bridgedToolResultMessage.content, /oldString must include enough unique surrounding context/);
-  const bridgedUserMessage = requestWithToolResult.rewritten.messages.find((msg) => msg.role === "user" && /Protocol requirements for your next reply/.test(msg.content || ""));
-  assert.ok(bridgedUserMessage);
-
-  const kimiToolResultRequest = transformRequestForBridge({
-    model: "moonshotai/kimi-k2.5:thinking",
-    tools: [
-      {
-        name: "write",
-        description: "Write a file",
-        parameters: { type: "object", properties: { filePath: { type: "string" } } }
-      }
-    ],
-    messages: [
-      { role: "user", content: "do it" },
-      {
-        role: "tool",
-        tool_call_id: "call_kimi",
-        content: "Wrote file successfully."
-      }
-    ]
-  });
-  const kimiBridgedToolResultMessage = kimiToolResultRequest.rewritten.messages.find((msg) => msg.role === "user" && /opencode-tool-result/.test(msg.content || ""));
-  assert.ok(kimiBridgedToolResultMessage);
-  assert.match(kimiBridgedToolResultMessage.content, /Always include the outer \[\[OPENCODE_TOOL\]\] \.\.\. \[\[\/OPENCODE_TOOL\]\] wrapper/);
-
-  const requestWithTypedToolResult = transformRequestForBridge({
-    model: "zai-org/glm-5:thinking",
-    tools: [
-      {
-        name: "write",
-        description: "Write a file",
-        parameters: { type: "object", properties: { filePath: { type: "string" } } }
-      }
-    ],
-    messages: [
-      { role: "user", content: "do it" },
-      {
-        role: "tool",
-        tool_call_id: "call_456",
-        content: [
-          { type: "text", text: "Wrote file successfully." },
-          { type: "text", text: "\nNext file ready." }
-        ]
-      }
-    ]
-  });
-  const bridgedTypedToolResultMessage = requestWithTypedToolResult.rewritten.messages.find((msg) => msg.role === "user" && /opencode-tool-result/.test(msg.content || ""));
-  assert.ok(bridgedTypedToolResultMessage);
-  assert.match(bridgedTypedToolResultMessage.content, /Wrote file successfully\./);
-  assert.match(bridgedTypedToolResultMessage.content, /Next file ready\./);
-
-  const requestWithTypedUserContent = transformRequestForBridge({
-    model: "zai-org/glm-5:thinking",
-    tools: [
-      {
-        name: "read",
-        description: "Read a file",
-        parameters: { type: "object", properties: { filePath: { type: "string" } } }
-      }
-    ],
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "I want a pie recipe" },
-          { type: "text", text: "\n<system-reminder>plan</system-reminder>" }
-        ]
-      }
-    ]
-  });
-  assert.match(requestWithTypedUserContent.rewritten.messages[2].content, /I want a pie recipe/);
-  assert.match(requestWithTypedUserContent.rewritten.messages[2].content, /system-reminder/);
-
-  assert.equal(isEmptyBridgeStopAggregate({
-    reasoning: "",
-    content: "",
-    finishReason: "stop"
-  }), true);
-  assert.equal(isEmptyBridgeStopAggregate({
-    reasoning: "thinking",
-    content: "",
-    finishReason: "stop"
-  }), false);
-  assert.equal(isEmptyBridgeStopAggregate({
-    reasoning: "",
-    content: "done",
-    finishReason: "stop"
-  }), false);
-
-  const recoveryRequest = buildEmptyStopRecoveryRequest({
-    messages: [
-      { role: "system", content: "bridge" },
-      { role: "user", content: "make a game" }
-    ]
-  });
-  assert.equal(recoveryRequest.messages.at(-1).role, "user");
-  assert.match(recoveryRequest.messages.at(-1).content, /Your previous reply was empty/);
-  assert.match(recoveryRequest.messages.at(-1).content, /Do not return an empty response/);
-
-  const parsedTool = parseBridgeAssistantText("```opencode-tool\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"hi\"}}]}\n```");
-  assert.equal(parsedTool.kind, "tool_calls");
-  assert.equal(parsedTool.toolCalls[0].function.name, "write");
-  assert.equal(parsedTool.toolCalls[0].function.arguments, JSON.stringify({ filePath: "a.txt", content: "hi" }));
-
-  const parsedFinal = parseBridgeAssistantText("```opencode-final\n{\"content\":\"done\"}\n```");
-  assert.equal(parsedFinal.kind, "final");
-  assert.equal(parsedFinal.content, "done");
-
-  const parsedTalkTool = parseBridgeAssistantText(
-    "[[TALK]]\nI found the file to change.\n[[/TALK]]\n[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"hi\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedTalkTool.kind, "tool_calls");
-  assert.equal(parsedTalkTool.content, "I found the file to change.");
-  assert.equal(parsedTalkTool.toolCalls[0].function.name, "write");
-
-  const parsedTalkFinal = parseBridgeAssistantText(
-    "[[TALK]]\nQuick note.\n[[/TALK]]\n[[OPENCODE_FINAL]]\nDone.\n[[/OPENCODE_FINAL]]"
-  );
-  assert.equal(parsedTalkFinal.kind, "final");
-  assert.match(parsedTalkFinal.content, /Quick note\./);
-  assert.match(parsedTalkFinal.content, /Done\./);
-
-  const parsedWrappedTool = parseBridgeAssistantText(
-    "I'll create it now.\n{\n  \"tool_calls\": [\n    {\n      \"name\": \"write\",\n      \"arguments\": {\n        \"filePath\": \"C:\\\\x\\\\a.txt\",\n        \"content\": \"hello\"\n      }\n    }\n  ]\n}"
-  );
-  assert.equal(parsedWrappedTool.kind, "tool_calls");
-  assert.equal(parsedWrappedTool.toolCalls[0].function.name, "write");
-
-  const parsedJsonFence = parseBridgeAssistantText(
-    "```json\n{\"tool_call\":{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"x\"}}}\n```"
-  );
-  assert.equal(parsedJsonFence.kind, "tool_calls");
-  assert.equal(parsedJsonFence.toolCalls[0].function.name, "write");
-
-  const parsedFunctionWrapper = parseBridgeAssistantText(
-    "{\"function\":{\"name\":\"read\",\"arguments\":{\"filePath\":\"b.txt\"}}}"
-  );
-  assert.equal(parsedFunctionWrapper.kind, "tool_calls");
-  assert.equal(parsedFunctionWrapper.toolCalls[0].function.name, "read");
-
-  const parsedArrayCalls = parseBridgeAssistantText(
-    "[{\"name\":\"glob\",\"arguments\":{\"pattern\":\"src/**/*.js\"}}]"
-  );
-  assert.equal(parsedArrayCalls.kind, "tool_calls");
-  assert.equal(parsedArrayCalls.toolCalls[0].function.name, "glob");
-
-  const parsedAnswerWrapper = parseBridgeAssistantText(
-    "```json\n{\"answer\":\"done\"}\n```"
-  );
-  assert.equal(parsedAnswerWrapper.kind, "final");
-  assert.equal(parsedAnswerWrapper.content, "done");
-
-  const parsedEmbeddedFinalWithLeadingJunk = parseBridgeAssistantText(
-    "{\"content\":\"]\\nHello\"}"
-  );
-  assert.equal(parsedEmbeddedFinalWithLeadingJunk.kind, "final");
-  assert.equal(parsedEmbeddedFinalWithLeadingJunk.content, "Hello");
-
-  const parsedToolMarker = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"z\"}}]}\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedToolMarker.kind, "tool_calls");
-  assert.equal(parsedToolMarker.toolCalls[0].function.name, "write");
-
-  const parsedCallMarker = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"z\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedCallMarker.kind, "tool_calls");
-  assert.equal(parsedCallMarker.toolCalls[0].function.name, "write");
-
-  const parsedMultiCallMarker = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}}\n[[/CALL]]\n[[CALL]]\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"b.txt\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedMultiCallMarker.kind, "tool_calls");
-  assert.equal(parsedMultiCallMarker.toolCalls.length, 2);
-  assert.equal(parsedMultiCallMarker.toolCalls[1].function.name, "read");
-
-  const parsedSingleBracketToolMarker = parseBridgeAssistantText(
-    "[OPENCODE_TOOL]\n{\"tool_calls\":{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"z\"}}}\n[/OPENCODE_TOOL]"
-  );
-  assert.equal(parsedSingleBracketToolMarker.kind, "tool_calls");
-  assert.equal(parsedSingleBracketToolMarker.toolCalls[0].function.name, "write");
-  assert.match(parsedSingleBracketToolMarker.toolCalls[0].function.arguments, /a.txt/);
-
-  const parsedLoosePluralToolMarker = parseBridgeAssistantText(
-    "[ OPENCODE_TOOLS ]\n\"tool_calls\": {\"name\":\"write\",\"arguments\":{\"filePath\":\"b.txt\",\"content\":\"y\"}}\n[/OPENCODE_TOOL]"
-  );
-  assert.equal(parsedLoosePluralToolMarker.kind, "tool_calls");
-  assert.equal(parsedLoosePluralToolMarker.toolCalls[0].function.name, "write");
-  assert.match(parsedLoosePluralToolMarker.toolCalls[0].function.arguments, /b.txt/);
-
-  const parsedBrokenToolMarker = parseBridgeAssistantText(
-    "OPENCODE_TOOL]\n[CALL]\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"c.txt\",\"content\":\"z\"}}\n[/CALL]\n[/OPENCODE_TOOL]"
-  );
-  assert.equal(parsedBrokenToolMarker.kind, "tool_calls");
-  assert.equal(parsedBrokenToolMarker.toolCalls[0].function.name, "write");
-
-  const parsedUnparseableToolEnvelope = parseBridgeAssistantText(
-    "[OPENCODE_TOOL]\n[CALL]\n{\"name\":\"bash\",\"arguments\":{\"command_b64\":\"abc\"\n[/CALL]\n[/OPENCODE_TOOL]"
-  );
-  assert.equal(parsedUnparseableToolEnvelope.kind, "invalid_tool_block");
-
-  const parsedFinalMarker = parseBridgeAssistantText(
-    "[[OPENCODE_FINAL]]\nDone.\n[[/OPENCODE_FINAL]]"
-  );
-  assert.equal(parsedFinalMarker.kind, "final");
-  assert.equal(parsedFinalMarker.content, "Done.");
-
-  const parsedSingleBracketFinalMarker = parseBridgeAssistantText(
-    "[OPENCODE_FINAL]\nDone.\n[/OPENCODE_FINAL]"
-  );
-  assert.equal(parsedSingleBracketFinalMarker.kind, "final");
-  assert.equal(parsedSingleBracketFinalMarker.content, "Done.");
-
-  const parsedLooseFinalMarker = parseBridgeAssistantText(
-    "[ OPENCODE_FINAL ]\nDone.\n[/OPENCODE_FINAL]"
-  );
-  assert.equal(parsedLooseFinalMarker.kind, "final");
-  assert.equal(parsedLooseFinalMarker.content, "Done.");
-
-  const parsedFinalWithLeadingJunk = parseBridgeAssistantText(
-    "[[OPENCODE_FINAL]]\n]\nHello\n[[/OPENCODE_FINAL]]"
-  );
-  assert.equal(parsedFinalWithLeadingJunk.kind, "final");
-  assert.equal(parsedFinalWithLeadingJunk.content, "Hello");
-
-  const parsedFinalWithBrokenClosingMarker = parseBridgeAssistantText(
-    "[[OPENCODE_FINAL]]\nHello\n[[/[OPENCODE_FINAL]"
-  );
-  assert.equal(parsedFinalWithBrokenClosingMarker.kind, "final");
-  assert.equal(parsedFinalWithBrokenClosingMarker.content, "Hello");
-
-  assert.equal(
-    extractStreamableFinalContent("[[OPENCODE_FINAL]]\nHello\n[[/[OPENCODE_FINAL]"),
-    "Hello\n"
-  );
-  assert.equal(
-    extractStreamableFinalContent("Done.\n[[/[OPENCODE_FINAL]"),
-    "Done.\n"
-  );
-
-  const parsedBracketNamedTool = parseBridgeAssistantText(
-    '[question]\n{"questions":[{"question":"What do you want?","header":"Type","options":[{"label":"A","description":"desc"}]}]}'
-  );
-  assert.equal(parsedBracketNamedTool.kind, "tool_calls");
-  assert.equal(parsedBracketNamedTool.toolCalls[0].function.name, "question");
-  assert.match(parsedBracketNamedTool.toolCalls[0].function.arguments, /What do you want\?/);
-
-  const parsedBracketNamedToolWithLeadingJunk = parseBridgeAssistantText(
-    ']\n[question]\n{"questions":[{"question":"What do you want?","header":"Type","options":[{"label":"A","description":"desc"}]}]}'
-  );
-  assert.equal(parsedBracketNamedToolWithLeadingJunk.kind, "tool_calls");
-  assert.equal(parsedBracketNamedToolWithLeadingJunk.toolCalls[0].function.name, "question");
-
-  const parsedLegacyCallWithParams = parseBridgeAssistantText(
-    "[OPENCODE_TOOL]\n[CALL]\n{\"tool\":\"explorer\",\"params\":{\"pattern\":\"**/*.{ts,tsx}\"},\"purpose\":\"Find TS files\"}\n[/CALL]\n[/OPENCODE_TOOL]"
-  );
-  assert.equal(parsedLegacyCallWithParams.kind, "tool_calls");
-  assert.equal(parsedLegacyCallWithParams.toolCalls[0].function.name, "explorer");
-  assert.match(parsedLegacyCallWithParams.toolCalls[0].function.arguments, /Find TS files/);
-
-  const parsedLegacyWriteWithSnakeCaseParams = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"tool\":\"write\",\"params\":{\"file_path\":\"boss.js\",\"content\":\"export const boss = true;\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedLegacyWriteWithSnakeCaseParams.kind, "tool_calls");
-  assert.equal(parsedLegacyWriteWithSnakeCaseParams.toolCalls[0].function.name, "write");
-  assert.equal(
-    parsedLegacyWriteWithSnakeCaseParams.toolCalls[0].function.arguments,
-    JSON.stringify({ filePath: "boss.js", content: "export const boss = true;" })
-  );
-
-  const parsedLegacyWriteWithTopLevelFields = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"tool\":\"write\",\"path\":\"boss.js\",\"content\":\"export const boss = true;\"}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedLegacyWriteWithTopLevelFields.kind, "tool_calls");
-  assert.equal(parsedLegacyWriteWithTopLevelFields.toolCalls[0].function.name, "write");
-  assert.equal(
-    parsedLegacyWriteWithTopLevelFields.toolCalls[0].function.arguments,
-    JSON.stringify({ filePath: "boss.js", content: "export const boss = true;" })
-  );
-
-  const parsedLegacyWriteWithToolInput = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"tool_name\":\"write\",\"tool_input\":{\"file_path\":\"boss.js\",\"content\":\"export const boss = true;\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedLegacyWriteWithToolInput.kind, "tool_calls");
-  assert.equal(parsedLegacyWriteWithToolInput.toolCalls[0].function.name, "write");
-
-  const nestedArgsSchema = [
-    {
-      type: "function",
-      function: {
-        name: "write",
-        parameters: {
-          type: "object",
-          properties: {
-            filePath: { type: "string" },
-            content: { type: "string" }
-          },
-          required: ["filePath", "content"]
-        }
-      }
-    }
-  ];
-  const nestedArgsOptions = {
-    toolArgKeyMap: core.buildToolArgumentKeyMap(nestedArgsSchema),
-    toolRequiredKeyMap: core.buildToolRequiredKeyMap(nestedArgsSchema)
   };
-  const parsedNestedArgumentsCall = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"write\",\"arguments\":{\"arguments\":{\"filePath\":\"src/csv.js\",\"content\":\"export const ok = true;\"}}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]",
-    nestedArgsOptions
-  );
-  assert.equal(parsedNestedArgumentsCall.kind, "tool_calls");
-  assert.equal(parsedNestedArgumentsCall.toolCalls[0].function.name, "write");
-  assert.deepEqual(
-    JSON.parse(parsedNestedArgumentsCall.toolCalls[0].function.arguments),
-    { filePath: "src/csv.js", content: "export const ok = true;" }
-  );
-  assert.equal(
-    parsedLegacyWriteWithToolInput.toolCalls[0].function.arguments,
-    JSON.stringify({ filePath: "boss.js", content: "export const boss = true;" })
-  );
 
-  const parsedShellAliasCall = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls -la\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedShellAliasCall.kind, "tool_calls");
-  assert.equal(parsedShellAliasCall.toolCalls[0].function.name, "bash");
+  const transformed = core.transformRequestForXmlBridge(body);
+  const prompt = transformed.rewritten.messages[0].content;
+  assert.match(prompt, /Batching a small independent check/);
+  assert.match(prompt, /<open>I will check both items now, then continue after the results\.<\/open>/);
+  assert.match(prompt, /keep batches small and clearly independent/);
+  assert.match(prompt, /Do not try to complete an entire multi-step task in one huge response/);
+  console.log("  PASS: parallel prompt example");
+})();
 
-  const parsedReadFileAlias = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"read_file\",\"arguments\":{\"filePath\":\"a.txt\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedReadFileAlias.kind, "tool_calls");
-  assert.equal(parsedReadFileAlias.toolCalls[0].function.name, "read");
-
-  const parsedCanonicalEnvelopeInsideProse = parseBridgeAssistantText(
-    "I will do it now.\n[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"filePath\":\"c.txt\"}}]}\n[[/OPENCODE_TOOL]]\nThanks."
-  );
-  assert.equal(parsedCanonicalEnvelopeInsideProse.kind, "tool_calls");
-  assert.equal(parsedCanonicalEnvelopeInsideProse.toolCalls[0].function.name, "read");
-
-  const parsedMultiTool = parseBridgeAssistantText(
-    "{\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}},{\"name\":\"write\",\"arguments\":{\"filePath\":\"b.txt\",\"content\":\"x\"}}]}"
-  );
-  assert.equal(parsedMultiTool.kind, "tool_calls");
-  assert.equal(parsedMultiTool.toolCalls.length, 2);
-  assert.equal(parsedMultiTool.toolCalls[0].function.name, "read");
-  assert.equal(parsedMultiTool.toolCalls[1].function.name, "write");
-
-  const parsedMultilineStringTool = parseBridgeAssistantText(
-    "{\n  \"tool_calls\": [\n    {\n      \"name\": \"edit\",\n      \"arguments\": {\n        \"filePath\": \"C:\\\\x\\\\main.css\",\n        \"oldString\": \"line1\nline2\nline3\",\n        \"newString\": \"done\"\n      }\n    }\n  ]\n}"
-  );
-  assert.equal(parsedMultilineStringTool.kind, "tool_calls");
-  assert.equal(parsedMultilineStringTool.toolCalls[0].function.name, "edit");
-  assert.match(parsedMultilineStringTool.toolCalls[0].function.arguments, /line1\\nline2\\nline3/);
-
-
-  const parsedMalformedTodoWrite = parseBridgeAssistantText(
-    "[[OPENCODE_TOOL]]\n{\n  \"tool_calls\": [\n    {\n      \"name\": \"todowrite\",\n      \"arguments\": {\n        \"todos\": [\n          {\n            \"content\": \"First task\",\n            \"status\": \"in_progress\",\n            \"priority\": \"high\"\n          },\n          {\n            \"content\": \"Second task\",\n            \"status\": \"pending\",\n            \"priority\": \"high\"\n          },\n            \"content\": \"Third task\",\n            \"status\": \"pending\",\n            \"priority\": \"medium\"\n        ]\n      }\n    }\n  ]\n}\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(parsedMalformedTodoWrite.kind, "tool_calls");
-  assert.equal(parsedMalformedTodoWrite.toolCalls[0].function.name, "todowrite");
-  assert.match(parsedMalformedTodoWrite.toolCalls[0].function.arguments, /First task/);
-  assert.match(parsedMalformedTodoWrite.toolCalls[0].function.arguments, /Third task/);
-
-  const transcript = parseSSETranscript([
-    'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
-    'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"reasoning":"think"},"finish_reason":null}]}',
-    'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"content":"```opencode-tool\\n{\\"tool_calls\\":[{\\"name\\":\\"write\\",\\"arguments\\":{\\"filePath\\":\\"a.txt\\",\\"content\\":\\"hi\\"}}]}\\n```"},"finish_reason":null}]}',
-    'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
-    'data: [DONE]'
-  ].join("\n"));
-  assert.equal(transcript.reasoning, "think");
-  assert.match(transcript.content, /opencode-tool/);
-
-  const completion = buildChatCompletionFromBridge(transcript);
-  assert.equal(completion.choices[0].finish_reason, "tool_calls");
-  assert.equal(completion.choices[0].message.content, "");
-  assert.equal(completion.choices[0].message.tool_calls[0].function.name, "write");
-
-  const multiToolTranscript = parseSSETranscript([
-    'data: {"id":"chatcmpl_2","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
-    'data: {"id":"chatcmpl_2","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"content":"[[OPENCODE_TOOL]]\\n{\\"tool_calls\\":[{\\"name\\":\\"read\\",\\"arguments\\":{\\"filePath\\":\\"a.txt\\"}},{\\"name\\":\\"read\\",\\"arguments\\":{\\"filePath\\":\\"b.txt\\"}}]\\n[[/OPENCODE_TOOL]]"},"finish_reason":null}]}',
-    'data: {"id":"chatcmpl_2","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
-    'data: [DONE]'
-  ].join("\n"));
-  const multiToolCompletion = buildChatCompletionFromBridge(multiToolTranscript);
-  assert.equal(multiToolCompletion.choices[0].finish_reason, "tool_calls");
-  assert.equal(multiToolCompletion.choices[0].message.tool_calls.length, 2);
-  assert.equal(multiToolCompletion.choices[0].message.tool_calls[0].function.name, "read");
-  assert.equal(multiToolCompletion.choices[0].message.tool_calls[1].function.name, "read");
-
-  const progressiveOne = extractProgressiveToolCalls(
-    '[[OPENCODE_TOOL]]\n{"tool_calls":[{"name":"read","arguments":{"filePath":"a.txt"}}'
-  );
-  assert.equal(progressiveOne.length, 1);
-  assert.equal(progressiveOne[0].function.name, "read");
-
-  const progressiveTwo = extractProgressiveToolCalls(
-    '[[OPENCODE_TOOL]]\n{"tool_calls":[{"name":"read","arguments":{"filePath":"a.txt"}},{"name":"read","arguments":{"filePath":"b.txt"}}'
-  );
-  assert.equal(progressiveTwo.length, 2);
-  assert.equal(progressiveTwo[1].function.name, "read");
-
-  const progressiveCallMarkers = extractProgressiveToolCalls(
-    '[[OPENCODE_TOOL]]\n[[CALL]]\n{"name":"read","arguments":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"name":"read","arguments":{"filePath":"b.txt"}}'
-  );
-  assert.equal(progressiveCallMarkers.length, 1);
-  assert.equal(progressiveCallMarkers[0].function.name, "read");
-
-  const progressiveClosedCallMarkers = extractProgressiveToolCalls(
-    '[[OPENCODE_TOOL]]\n[[CALL]]\n{"name":"read","arguments":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"name":"read","arguments":{"filePath":"b.txt"}}\n[[/CALL]]'
-  );
-  assert.equal(progressiveClosedCallMarkers.length, 2);
-  assert.equal(progressiveClosedCallMarkers[1].function.name, "read");
-
-  const progressiveToolEndImplicitClose = extractProgressiveToolCalls(
-    '[[OPENCODE_TOOL]]\n[[CALL]]\n{"name":"write","arguments":{"filePath":"player.js","content":"player"}}\n[[/CALL]]\n[[CALL]]\n{"name":"write","arguments":{"filePath":"enemy.js","content":"enemy"}}\n[[/OPENCODE_TOOL]]'
-  );
-  assert.equal(progressiveToolEndImplicitClose.length, 2);
-  assert.equal(progressiveToolEndImplicitClose[0].function.arguments, '{"filePath":"player.js","content":"player"}');
-  assert.equal(progressiveToolEndImplicitClose[1].function.arguments, '{"filePath":"enemy.js","content":"enemy"}');
-
-  const progressiveCallOnlyMarkers = extractProgressiveToolCalls(
-    '[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"b.txt"}}'
-  );
-  assert.equal(progressiveCallOnlyMarkers.length, 1);
-  assert.equal(progressiveCallOnlyMarkers[0].function.name, "read");
-
-  const progressiveMalformedCallCloser = extractProgressiveToolCalls(
-    '[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"a.txt"}}\n/CALL]]'
-  );
-  assert.equal(progressiveMalformedCallCloser.length, 1);
-  assert.equal(progressiveMalformedCallCloser[0].function.name, "read");
-
-  const parsedCallOnlyMarkers = parseBridgeAssistantText(
-    '[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"b.txt"}}\n[[/CALL]]'
-  );
-  assert.equal(parsedCallOnlyMarkers.kind, "tool_calls");
-  assert.equal(parsedCallOnlyMarkers.toolCalls.length, 2);
-  assert.equal(parsedCallOnlyMarkers.toolCalls[1].function.name, "read");
-
-  const ignoresReasoningMarkers = buildBridgeResultFromText(
-    "Normal final text.",
-    "[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"ignore.txt\",\"content\":\"x\"}}]}\n[[/OPENCODE_TOOL]]"
-  );
-  assert.equal(ignoresReasoningMarkers.kind, "final");
-  assert.equal(ignoresReasoningMarkers.finishReason, "stop");
-  assert.equal(ignoresReasoningMarkers.message.content, "Normal final text.");
-
-  const stillUsesContentMarkers = buildBridgeResultFromText(
-    "[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"real.txt\",\"content\":\"x\"}}]}\n[[/OPENCODE_TOOL]]",
-    "I should use [[OPENCODE_TOOL]] in content."
-  );
-  assert.equal(stillUsesContentMarkers.kind, "tool_calls");
-  assert.equal(stillUsesContentMarkers.finishReason, "tool_calls");
-  assert.equal(stillUsesContentMarkers.message.tool_calls[0].function.name, "write");
-
-
-  const talkResult = buildBridgeResultFromText(
-    "[[TALK]]\nI found the failing test.\n[[/TALK]]\n[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]",
-    ""
-  );
-  assert.equal(talkResult.kind, "tool_calls");
-  assert.equal(talkResult.message.content, "I found the failing test.");
-  const bashToolSchema = [
-    {
+// ---- Test: encodeAssistantToolCallsMessage ----
+(function testAssistantHistoryEncoding() {
+  const encoded = core.encodeAssistantToolCallsMessage({
+    role: "assistant",
+    content: "I found the issue.",
+    tool_calls: [{
+      id: "call_1",
       type: "function",
       function: {
         name: "bash",
-        parameters: {
-          type: "object",
-          properties: {
-            command: { type: "string" },
-            description: { type: "string" }
-          },
-          required: ["command", "description"]
-        }
+        arguments: JSON.stringify({ command: "npm test", timeout: 30000 })
       }
-    }
-  ];
-  const bashParseOptions = {
-    toolArgKeyMap: core.buildToolArgumentKeyMap(bashToolSchema),
-    toolRequiredKeyMap: core.buildToolRequiredKeyMap(bashToolSchema)
+    }]
+  }, ["bash"]);
+  assert.match(encoded, /I found the issue\./);
+  assert.match(encoded, /<bash>/);
+  assert.match(encoded, /<command>/);
+  assert.match(encoded, /npm test/);
+  assert.match(encoded, /<\/bash>/);
+  console.log("  PASS: encodeAssistantToolCallsMessage");
+})();
+
+// ---- Test: parseXmlAssistantText with tool calls ----
+(function testParseXmlAssistantTextToolCall() {
+  const toolNames = ["edit_file"];
+  const parsed = core.parseXmlAssistantText(`
+I found the failing test. I will patch it.
+
+<edit_file>
+<filePath>tests/test.js</filePath>
+<newString>console.log('ok')</newString>
+</edit_file>`, toolNames);
+  assert.equal(parsed.kind, "tool_calls");
+  assert.match(parsed.content, /I found the failing test/);
+  const call = parsed.toolCalls[0];
+  assert.equal(call.function.name, "edit_file");
+  assert.equal(JSON.parse(call.function.arguments).filePath, "tests/test.js");
+  assert.equal(JSON.parse(call.function.arguments).newString, "console.log('ok')");
+  console.log("  PASS: parseXmlAssistantText (tool_calls)");
+})();
+
+// ---- Test: JSON-style escaped string arguments are decoded for string params ----
+(function testJsonStyleEscapesDecode() {
+  const tools = [{ name: "write", args: [{ name: "filePath", type: "string" }, { name: "content", type: "string" }] }];
+  const parsed = core.parseXmlAssistantText(`
+<write>
+<filePath>C:\\repo\\file.py</filePath>
+<content>line1\nline2\nprint(\"ok\")</content>
+</write>`, tools);
+  assert.equal(parsed.kind, "tool_calls");
+  const args = JSON.parse(parsed.toolCalls[0].function.arguments);
+  assert.equal(args.filePath, "C:\repo\file.py");
+  assert.equal(args.content, 'line1\nline2\nprint("ok")');
+  console.log("  PASS: JSON-style escaped string args decode");
+})();
+
+// ---- Test: parseXmlAssistantText final (no tool calls) ----
+(function testParseXmlAssistantTextFinal() {
+  const parsed = core.parseXmlAssistantText(`All tests pass now.`, ["edit_file"]);
+  assert.equal(parsed.kind, "final");
+  assert.equal(parsed.content, "All tests pass now.");
+  console.log("  PASS: parseXmlAssistantText (final)");
+})();
+
+// ---- Test: reasoning-only empty final turn is invalid when tools are enabled ----
+(function testInvalidBridgeCompletion() {
+  const result = core.buildBridgeResultFromText("", "I should inspect the file first.", ["read_file"]);
+  assert.equal(result.kind, "invalid");
+  assert.equal(result.error.code, "invalid_bridge_completion");
+  console.log("  PASS: invalid bridge completion");
+})();
+
+// ---- Test: recover XML tool calls misplaced into reasoning ----
+(function testRecoverToolCallFromReasoning() {
+  const result = core.buildBridgeResultFromText("", `Let me fix it now.\n\n<edit>\n<filePath>src/app.py</filePath>\n<oldString>bad</oldString>\n<newString>good</newString>\n</edit>`, [{ name: "edit", args: [{ name: "filePath", type: "string" }, { name: "oldString", type: "string" }, { name: "newString", type: "string" }] }]);
+  assert.equal(result.kind, "tool_calls");
+  assert.equal(result.message.tool_calls[0].function.name, "edit");
+  assert.equal(result.message.reasoning_content, "Let me fix it now.");
+  const args = JSON.parse(result.message.tool_calls[0].function.arguments);
+  assert.equal(args.filePath, "src/app.py");
+  assert.equal(args.oldString, "bad");
+  assert.equal(args.newString, "good");
+  console.log("  PASS: recover tool call from reasoning");
+})();
+
+// ---- Test: JSON completion translation ----
+(function testJsonCompletionTranslation() {
+  const toolNames = ["read_file"];
+  const aggregate = {
+    id: "chatcmpl_test",
+    model: "test-model",
+    created: 123,
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    reasoning: "Reasoning here",
+    content: `I found it.\n<read_file>\n<path>README.md</path>\n</read_file>`
   };
-  const bashCallFromB64 = buildBridgeResultFromText(
-    "[OPENCODE_TOOL]\n[CALL]\n{\n  \"name\": \"bash\",\n  \"arguments\": {\n    \"command_b64\": \"bm9kZSB0ZXN0cy90ZXN0Lmpz\"\n  }\n}\n[/CALL]\n[/OPENCODE_TOOL]",
-    "",
-    bashParseOptions
-  );
-  assert.equal(bashCallFromB64.kind, "tool_calls");
-  assert.equal(bashCallFromB64.message.tool_calls[0].function.name, "bash");
-  const bashArgs = JSON.parse(bashCallFromB64.message.tool_calls[0].function.arguments);
-  assert.equal(bashArgs.command, "node tests/test.js");
-  assert.match(bashArgs.description, /Run shell command:/);
+  const translated = core.buildChatCompletionFromXmlBridge(aggregate, toolNames);
+  assert.equal(translated.choices[0].finish_reason, "tool_calls");
+  assert.match(translated.choices[0].message.content, /I found it/);
+  assert.equal(translated.choices[0].message.tool_calls[0].function.name, "read_file");
+  console.log("  PASS: JSON completion translation");
+})();
 
-  const finalResultWithLeadingJunk = buildBridgeResultFromText("]\nHello", "");
-  assert.equal(finalResultWithLeadingJunk.kind, "final");
-  assert.equal(finalResultWithLeadingJunk.message.content, "Hello");
+// ---- Test: SSE translation ----
+(function testSseTranslation() {
+  const toolNames = ["bash"];
+  const aggregate = {
+    id: "chatcmpl_stream",
+    model: "test-model",
+    created: 456,
+    usage: null,
+    reasoning: "Thinking",
+    content: `Running tests now.\n<bash>\n<command>npm test</command>\n</bash>`
+  };
+  const translated = core.buildSSEFromXmlBridge(aggregate, toolNames);
+  assert.match(translated, /"reasoning":"Thinking"/);
+  assert.match(translated, /Running tests now/);
+  assert.match(translated, /"tool_calls"/);
+  assert.match(translated, /"finish_reason":"tool_calls"/);
+  console.log("  PASS: SSE translation");
+})();
 
-  const invalidToolBlockResult = buildBridgeResultFromText(
-    "[OPENCODE_TOOL]\n[CALL]\n{\"name\":\"bash\",\"arguments\":{\"command_b64\":\"abc\"\n[/CALL]\n[/OPENCODE_TOOL]",
-    ""
-  );
-  assert.equal(invalidToolBlockResult.kind, "invalid_tool_block");
-  assert.match(invalidToolBlockResult.message.content, /Tool call payload was malformed/);
+// ---- Test: multiple tool calls ----
+(function testMultipleToolCalls() {
+  const toolNames = ["read_file"];
+  const parsed = core.parseXmlAssistantText(`
+Let me read both files.
 
-  const sse = buildSSEFromBridge(transcript);
-  assert.match(sse, /"finish_reason":"tool_calls"/);
-  assert.match(sse, /"tool_calls"/);
+<read_file>
+<path>src/app.js</path>
+</read_file>
 
-  const multiToolSse = buildSSEFromBridge(multiToolTranscript);
-  assert.match(multiToolSse, /"tool_calls"/);
-  assert.match(multiToolSse, /"index":0/);
-  assert.match(multiToolSse, /"index":1/);
+<read_file>
+<path>src/index.js</path>
+</read_file>`, toolNames);
+  assert.equal(parsed.kind, "tool_calls");
+  assert.equal(parsed.toolCalls.length, 2);
+  assert.equal(parsed.toolCalls[0].function.name, "read_file");
+  assert.equal(JSON.parse(parsed.toolCalls[0].function.arguments).path, "src/app.js");
+  assert.equal(JSON.parse(parsed.toolCalls[1].function.arguments).path, "src/index.js");
+  console.log("  PASS: multiple tool calls");
+})();
 
-  process.stdout.write("selftest ok\n");
+// ---- Test: preserve emitted tool call order ----
+(function testToolCallOrderPreserved() {
+  const tools = [
+    { name: "bash", args: [{ name: "command", type: "string" }] },
+    { name: "read_file", args: [{ name: "path", type: "string" }] }
+  ];
+  const parsed = core.parseXmlAssistantText(`
+<read_file>
+<path>src/app.js</path>
+</read_file>
+
+<bash>
+<command>echo hi</command>
+</bash>`, tools);
+  assert.equal(parsed.kind, "tool_calls");
+  assert.deepEqual(parsed.toolCalls.map((call) => call.function.name), ["read_file", "bash"]);
+  console.log("  PASS: tool call order preserved");
+})();
+
+// ---- Test: unrelated XML tags are ignored ----
+(function testUnrelatedXmlIgnored() {
+  const toolNames = ["read_file"];
+  const parsed = core.parseXmlAssistantText(`
+<thinking>I should check the file first</thinking>
+
+<task type="analyze">do stuff</task>
+
+<read_file>
+<path>src/app.js</path>
+</read_file>`, toolNames);
+  assert.equal(parsed.kind, "tool_calls");
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].function.name, "read_file");
+  // The unrelated XML should remain in the content
+  assert.match(parsed.content, /thinking/);
+  console.log("  PASS: unrelated XML tags ignored");
+})();
+
+// ---- Test: Parse parameters from XML attributes ----
+(function testAttributeParameters() {
+  const toolNames = ["task"];
+  const parsed = core.parseXmlAssistantText(`
+<task description="Explore codebase structure" prompt="Find files" subagent_type="explore"></task>
+  `, toolNames);
+  
+  assert.equal(parsed.kind, "tool_calls");
+  assert.equal(parsed.toolCalls.length, 1);
+  const args = JSON.parse(parsed.toolCalls[0].function.arguments);
+  assert.equal(args.description, "Explore codebase structure");
+  assert.equal(args.prompt, "Find files");
+  assert.equal(args.subagent_type, "explore");
+  console.log("  PASS: parameters from XML attributes");
+})();
+
+// ---- Test: dotted and dashed attribute names survive generic parsing ----
+(function testExtendedAttributeNames() {
+  const toolNames = ["task"];
+  const parsed = core.parseXmlAssistantText(`
+<task trace.id="abc123" subagent-type="explore"></task>
+  `, toolNames);
+
+  assert.equal(parsed.kind, "tool_calls");
+  const args = JSON.parse(parsed.toolCalls[0].function.arguments);
+  assert.equal(args["trace.id"], "abc123");
+  assert.equal(args["subagent-type"], "explore");
+  console.log("  PASS: extended attribute names");
+})();
+
+// ---- Test: Mixed attributes and child tags ----
+(function testMixedParameters() {
+  const toolNames = ["task"];
+  const parsed = core.parseXmlAssistantText(`
+<task subagent_type="explore" description="Search">
+<prompt>Detailed instructions here</prompt>
+</task>
+  `, toolNames);
+  
+  assert.equal(parsed.kind, "tool_calls");
+  const args = JSON.parse(parsed.toolCalls[0].function.arguments);
+  assert.equal(args.subagent_type, "explore");
+  assert.equal(args.description, "Search");
+  assert.equal(args.prompt, "Detailed instructions here");
+  console.log("  PASS: mixed attributes and child tags");
+})();
+
+// ---- Test: camelCase attribute parameters ----
+(function testCamelCaseAttributeParameters() {
+  const tools = [{ name: "edit_file", args: [{ name: "filePath", type: "string" }] }];
+  const parsed = core.parseXmlAssistantText(`
+<edit_file filePath="src/app.js"></edit_file>
+  `, tools);
+
+  assert.equal(parsed.kind, "tool_calls");
+  assert.equal(JSON.parse(parsed.toolCalls[0].function.arguments).filePath, "src/app.js");
+  console.log("  PASS: camelCase attribute parameters");
+})();
+
+// ---- Test: object/array parameters preserve raw JSON text ----
+(function testStructuredArgumentPassThrough() {
+  const tools = [{
+    name: "edit_file",
+    args: [{ name: "changes", type: "array" }]
+  }];
+  const parsed = core.parseXmlAssistantText(`
+<edit_file>
+<changes>[{"path":"src/app.js","old":"a","new":"b"}]</changes>
+</edit_file>
+  `, tools);
+
+  assert.equal(parsed.kind, "tool_calls");
+  assert.equal(JSON.parse(parsed.toolCalls[0].function.arguments).changes[0].path, "src/app.js");
+  console.log("  PASS: structured argument passthrough");
+})();
+
+// ---- Test: <open> tags are stripped from visible content ----
+(function testOpenTagsStripped() {
+  const tools = [{ name: "bash", args: [{ name: "command", type: "string" }] }];
+  const parsed = core.parseXmlAssistantText(`
+<open>I will run the tests now.</open>
+<bash>
+<command>npm test</command>
+</bash>`, tools);
+
+  assert.equal(parsed.kind, "tool_calls");
+  assert.equal(parsed.content, "I will run the tests now.");
+
+  const aggregate = {
+    id: "chatcmpl_open",
+    model: "test-model",
+    created: 789,
+    usage: null,
+    reasoning: "",
+    content: `<open>I will run the tests now.</open>\n<bash><command>npm test</command></bash>`
+  };
+  const translated = core.buildChatCompletionFromXmlBridge(aggregate, tools);
+  assert.equal(translated.choices[0].message.content, "I will run the tests now.");
+  console.log("  PASS: open tags stripped");
+})();
+
+// ---- Test: Streaming XML Parser ----
+(function testStreamingXmlParser() {
+  const toolNames = ["bash", "read_file"];
+  
+  let contentEmitted = "";
+  const toolsEmitted = [];
+  
+  const parser = new core.StreamingXmlParser(toolNames, {
+    onContent: (text) => contentEmitted += text,
+    onToolCall: (call, idx) => toolsEmitted.push({ call, idx })
+  });
+
+  const stream = "Here is the issue.\n<ba";
+  parser.feed(stream);
+  assert.equal(contentEmitted, "Here is the issue.\n");
+  
+  parser.feed("sh><command>echo hi</comm");
+  assert.equal(contentEmitted, "Here is the issue.\n");
+  assert.equal(toolsEmitted.length, 0); // Still buffering
+  
+  parser.feed("and></bash>Done.");
+  assert.equal(contentEmitted, "Here is the issue.\nDone.");
+  assert.equal(toolsEmitted.length, 1);
+  assert.equal(toolsEmitted[0].call.function.name, "bash");
+  assert.equal(JSON.parse(toolsEmitted[0].call.function.arguments).command, "echo hi");
+  assert.equal(toolsEmitted[0].idx, 0);
+
+  // Test false alarm
+  parser.feed("<bastard>Not a tool</bastard>");
+  // Wait, parser emits instantly on false alarm
+  assert.match(contentEmitted, /<bastard>Not a tool<\/bastard>/);
+
+  console.log("  PASS: StreamingXmlParser");
+})();
+
+// ---- Test: StreamingXmlParser recognizes tool tags with tab-separated attrs ----
+(function testStreamingXmlParserWhitespaceAttrs() {
+  const tools = [{ name: "bash", args: [{ name: "command", type: "string" }] }];
+  let content = "";
+  const calls = [];
+  const parser = new core.StreamingXmlParser(tools, {
+    onContent: (text) => content += text,
+    onToolCall: (call) => calls.push(call)
+  });
+
+  parser.feed("Before\n<bash\tdata-x=\"1\"><command>echo hi</command></bash>\nAfter");
+  parser.flush();
+
+  assert.equal(calls.length, 1);
+  assert.equal(JSON.parse(calls[0].function.arguments).command, "echo hi");
+  assert.match(content, /Before/);
+  assert.match(content, /After/);
+  console.log("  PASS: StreamingXmlParser whitespace attrs");
+})();
+
+// ---- Test: Plugin install is idempotent ----
+async function testPluginIdempotentInstall() {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async function testFetch() {
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const mod = await import('file:///c:/Debug%20attempt/Nano_Proxy/src/plugin.mjs');
+    await mod.NanoProxyPlugin();
+    const once = globalThis.fetch;
+    await mod.NanoProxyPlugin();
+    const twice = globalThis.fetch;
+    assert.notEqual(once, originalFetch);
+    assert.equal(once, twice);
+    console.log('  PASS: plugin install idempotent');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis[Symbol.for('nanoproxy.fetchPatch')];
+  }
 }
 
-run();
+// ---- Test: Plugin streaming returns response immediately ----
+async function testPluginStreamingReturnsImmediately() {
+  const originalFetch = globalThis.fetch;
+  try {
+    const mod = await import('file:///c:/Debug%20attempt/Nano_Proxy/src/plugin.mjs');
+    const upstream = new TransformStream();
+    globalThis.fetch = async function testFetch() {
+      return new Response(upstream.readable, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      });
+    };
+
+    await mod.NanoProxyPlugin();
+
+    const requestBody = {
+      model: 'glm-5',
+      stream: true,
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'bash',
+          parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] }
+        }
+      }]
+    };
+
+    const fetchPromise = globalThis.fetch('https://nano-gpt.com/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(requestBody)
+    });
+
+    const response = await Promise.race([
+      fetchPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('plugin fetch did not return promptly')), 250))
+    ]);
+
+    assert.equal(response instanceof Response, true);
+    assert.match(response.headers.get('content-type') || '', /text\u002fevent-stream/i);
+    await upstream.writable.abort();
+    console.log('  PASS: plugin streaming returns immediately');
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis[Symbol.for('nanoproxy.fetchPatch')];
+  }
+}
+
+
+function withBridgeProtocol(protocol, fn) {
+  const previous = process.env.BRIDGE_PROTOCOL;
+  if (protocol == null) delete process.env.BRIDGE_PROTOCOL;
+  else process.env.BRIDGE_PROTOCOL = protocol;
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.BRIDGE_PROTOCOL;
+    else process.env.BRIDGE_PROTOCOL = previous;
+  }
+}
+
+// ---- Test: object bridge request rewrite ----
+(function testTransformRequestForObjectBridge() {
+  withBridgeProtocol('object', () => {
+    const body = {
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'Fix the file' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'todowrite',
+          description: 'Write todos',
+          parameters: {
+            type: 'object',
+            properties: {
+              todos: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    content: { type: 'string' },
+                    status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] }
+                  },
+                  required: ['content', 'status']
+                }
+              }
+            },
+            required: ['todos']
+          }
+        }
+      }]
+    };
+    const transformed = core.transformRequestForBridge(body);
+    assert.equal(transformed.protocol, 'object');
+    assert.equal(transformed.bridgeApplied, true);
+    assert.ok(!('tools' in transformed.rewritten));
+    assert.match(transformed.rewritten.messages[0].content, /Structured Turn Contract/);
+    assert.match(transformed.rewritten.messages[0].content, /"mode"/);
+    assert.match(transformed.rewritten.messages[0].content, /"items"/);
+    assert.match(transformed.rewritten.messages[0].content, /"content"/);
+    assert.match(transformed.rewritten.messages[0].content, /"status"/);
+  });
+  console.log('  PASS: transformRequestForObjectBridge');
+})();
+
+// ---- Test: object bridge result translation ----
+(function testBuildBridgeResultFromObjectText() {
+  withBridgeProtocol('object', () => {
+    const result = core.buildBridgeResultFromText(JSON.stringify({
+      v: 1,
+      mode: 'tool',
+      message: 'I will patch the file now.',
+      tool_calls: [{ name: 'edit', arguments: { filePath: 'src/app.js', oldString: 'bad', newString: 'good' } }]
+    }), '', [{ name: 'edit' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, 'I will patch the file now.');
+    assert.equal(result.message.tool_calls[0].function.name, 'edit');
+    assert.deepEqual(JSON.parse(result.message.tool_calls[0].function.arguments), { filePath: 'src/app.js', oldString: 'bad', newString: 'good' });
+  });
+  console.log('  PASS: buildBridgeResultFromObjectText');
+})();
+
+// ---- Test: StreamingObjectParser emits message and tool calls ----
+(function testStreamingObjectParser() {
+  withBridgeProtocol('object', () => {
+    let contentEmitted = '';
+    const calls = [];
+    const parser = core.createStreamingBridgeParser([{ name: 'read' }], {
+      onContent: (text) => contentEmitted += text,
+      onToolCall: (call, idx) => calls.push({ call, idx })
+    });
+    parser.feed('{"v":1,"mode":"tool","message":"I will inspect now.","tool_calls":[{"name":"read","arguments":{"path":"README.md"}}]}');
+    parser.flush();
+    assert.equal(contentEmitted, 'I will inspect now.');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].idx, 0);
+    assert.equal(calls[0].call.function.name, 'read');
+    assert.deepEqual(JSON.parse(calls[0].call.function.arguments), { path: 'README.md' });
+  });
+  console.log('  PASS: StreamingObjectParser');
+})();
+
+// ---- Test: object bridge rejects plain prose without a turn object ----
+(function testBuildBridgeResultFromPlainProseIsInvalidInObjectMode() {
+  withBridgeProtocol('object', () => {
+    const result = core.buildBridgeResultFromText('I will start by creating the project structure.', 'reasoning here', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'invalid');
+    assert.equal(result.error.code, 'missing_bridge_object_turn');
+  });
+  console.log('  PASS: buildBridgeResultFromPlainProseIsInvalidInObjectMode');
+})();
+// ---- Test: object bridge accepts flattened tool-call arguments ----
+(function testBuildBridgeResultFromFlattenedObjectText() {
+  withBridgeProtocol('object', () => {
+    const result = core.buildBridgeResultFromText(JSON.stringify({
+      v: 1,
+      mode: 'tool',
+      message: 'Creating folders now.',
+      tool_calls: [{ name: 'bash', command: 'mkdir -p src tests', description: 'Create folders' }]
+    }), '', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, 'Creating folders now.');
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+    assert.deepEqual(JSON.parse(result.message.tool_calls[0].function.arguments), {
+      command: 'mkdir -p src tests',
+      description: 'Create folders'
+    });
+  });
+  console.log('  PASS: buildBridgeResultFromFlattenedObjectText');
+})();
+
+// ---- Test: object bridge accepts modest multi-tool batches ----
+(function testBuildBridgeResultFromObjectTextThreeTools() {
+  withBridgeProtocol('object', () => {
+    const result = core.buildBridgeResultFromText(JSON.stringify({
+      v: 1,
+      mode: 'tool',
+      message: 'Creating project structure now.',
+      tool_calls: [
+        { name: 'bash', arguments: { command: 'mkdir -p project/tests', description: 'Create directories' } },
+        { name: 'write', arguments: { filePath: 'project/__init__.py', content: '' } },
+        { name: 'write', arguments: { filePath: 'project/tests/__init__.py', content: '' } }
+      ]
+    }), '', [{ name: 'bash' }, { name: 'write' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.tool_calls.length, 3);
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+    assert.equal(result.message.tool_calls[1].function.name, 'write');
+    assert.equal(result.message.tool_calls[2].function.name, 'write');
+  });
+  console.log('  PASS: buildBridgeResultFromObjectText three tools');
+})();
+// ---- Test: StreamingObjectParser accepts flattened tool-call arguments ----
+(function testStreamingObjectParserFlattened() {
+  withBridgeProtocol('object', () => {
+    let contentEmitted = '';
+    const calls = [];
+    const parser = core.createStreamingBridgeParser([{ name: 'bash' }], {
+      onContent: (text) => contentEmitted += text,
+      onToolCall: (call, idx) => calls.push({ call, idx })
+    });
+    parser.feed('{"v":1,"mode":"tool","message":"Creating folders now.","tool_calls":[{"name":"bash","command":"mkdir -p src tests","description":"Create folders"}]}');
+    parser.flush();
+    assert.equal(contentEmitted, 'Creating folders now.');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].call.function.name, 'bash');
+    assert.deepEqual(JSON.parse(calls[0].call.function.arguments), {
+      command: 'mkdir -p src tests',
+      description: 'Create folders'
+    });
+  });
+  console.log('  PASS: StreamingObjectParser flattened');
+})();
+// ---- Test: object bridge assistant tool-call history stays in V3 JSON form ----
+(function testObjectBridgeAssistantHistoryEncoding() {
+  withBridgeProtocol('object', () => {
+    const transformed = core.transformRequestForBridge({
+      model: 'test-model',
+      messages: [{
+        role: 'assistant',
+        content: 'Creating project directory structure with Windows commands.',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'bash',
+            arguments: JSON.stringify({ command: 'mkdir -p incident_simulator/logs', description: 'Create directories' })
+          }
+        }]
+      }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'bash',
+          parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] }
+        }
+      }]
+    });
+    const assistantHistory = transformed.rewritten.messages[1].content;
+    assert.doesNotMatch(assistantHistory, /ASSISTANT_TOOL_CALLS_JSON/);
+    const parsed = JSON.parse(assistantHistory);
+    assert.equal(parsed.v, 1);
+    assert.equal(parsed.mode, 'tool');
+    assert.equal(parsed.message, 'Creating project directory structure with Windows commands.');
+    assert.equal(parsed.tool_calls[0].name, 'bash');
+  });
+  console.log('  PASS: object bridge assistant history encoding');
+})();
+
+// ---- Test: object bridge accepts fenced JSON output ----
+(function testBuildBridgeResultFromFencedObjectText() {
+  withBridgeProtocol('object', () => {
+    const result = core.buildBridgeResultFromText('```json\n{"v":1,"mode":"tool","message":"Creating folders now.","tool_calls":[{"name":"bash","arguments":{"command":"mkdir -p src tests"}}]}\n```', '', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, 'Creating folders now.');
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+  });
+  console.log('  PASS: buildBridgeResultFromFencedObjectText');
+})();
+
+// ---- Test: object bridge accepts legacy assistant markers with tool payload ----
+(function testBuildBridgeResultFromLegacyAssistantMarkers() {
+  withBridgeProtocol('object', () => {
+    const legacy = '[ASSISTANT_MESSAGE]\nCreating project directory structure with Windows commands.\n\n[ASSISTANT_TOOL_CALLS_JSON]\n{"name":"bash","arguments":{"command":"mkdir -p incident_simulator/logs incident_simulator/tests","description":"Create project directory structure"}}';
+    const result = core.buildBridgeResultFromText(legacy, '', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, 'Creating project directory structure with Windows commands.');
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+    assert.deepEqual(JSON.parse(result.message.tool_calls[0].function.arguments), {
+      command: 'mkdir -p incident_simulator/logs incident_simulator/tests',
+      description: 'Create project directory structure'
+    });
+  });
+  console.log('  PASS: buildBridgeResultFromLegacyAssistantMarkers');
+})();
+
+// ---- Test: object bridge accepts legacy assistant marker typo with tool array ----
+(function testBuildBridgeResultFromLegacyAssistantMarkerTypo() {
+  withBridgeProtocol('object', () => {
+    const legacy = '[ASSASSANT_TOOL_CALLS_JSON]\n[{"name":"bash","arguments":{"command":"mkdir -p incident_simulator/logs","description":"Create project directory structure"}}]';
+    const result = core.buildBridgeResultFromText(legacy, '', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, '');
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+  });
+  console.log('  PASS: buildBridgeResultFromLegacyAssistantMarkerTypo');
+})();
+// ---- Test: object bridge accepts prose wrapped around usable JSON ----
+(function testBuildBridgeResultFromProseWrappedObject() {
+  withBridgeProtocol('object', () => {
+    const wrapped = 'I will do it now.\n\n{"toolCalls":{"function":{"name":"bash","arguments":"{\\"command\\":\\"echo hi\\"}"}},"content":"Running command."}\nThanks';
+    const result = core.buildBridgeResultFromText(wrapped, '', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, 'Running command.');
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+    assert.deepEqual(JSON.parse(result.message.tool_calls[0].function.arguments), { command: 'echo hi' });
+  });
+  console.log('  PASS: buildBridgeResultFromProseWrappedObject');
+})();
+
+// ---- Test: object bridge salvages malformed write batches with raw code strings ----
+(function testBuildBridgeResultFromMalformedWriteBatch() {
+  withBridgeProtocol('object', () => {
+    const malformed = '{"v":1,"mode":"tool","message":"Creating core package modules with generator, parser, detector, and CLI.","tool_calls":[{"name":"write","filePath":"C:\\Cline_test\\incident_simulator\\__init__.py","content":"__version__ = "1.0.0"\n"},{"name":"write","filePath":"C:\\Cline_test\\incident_simulator\\generators\\__init__.py","content":"from .base import LogGenerator\nfrom .api_generator import APILogGenerator\n"}]}'
+    const result = core.buildBridgeResultFromText(malformed, '', [{ name: 'write', args: [{ name: 'filePath' }, { name: 'content' }] }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, 'Creating core package modules with generator, parser, detector, and CLI.');
+    assert.equal(result.message.tool_calls.length, 2);
+    assert.equal(result.message.tool_calls[0].function.name, 'write');
+    assert.equal(JSON.parse(result.message.tool_calls[0].function.arguments).filePath, 'C:\\Cline_test\\incident_simulator\\__init__.py');
+    assert.equal(JSON.parse(result.message.tool_calls[0].function.arguments).content, '__version__ = "1.0.0"\n');
+  });
+  console.log('  PASS: buildBridgeResultFromMalformedWriteBatch');
+})();
+// ---- Test: object bridge accepts top-level tool-call arrays ----
+(function testBuildBridgeResultFromTopLevelToolArray() {
+  withBridgeProtocol('object', () => {
+    const result = core.buildBridgeResultFromText('[{"name":"bash","arguments":{"command":"echo hi"}}]', '', [{ name: 'bash' }]);
+    assert.equal(result.kind, 'tool_calls');
+    assert.equal(result.message.content, '');
+    assert.equal(result.message.tool_calls[0].function.name, 'bash');
+  });
+  console.log('  PASS: buildBridgeResultFromTopLevelToolArray');
+})();
+(async () => {
+  await testPluginIdempotentInstall();
+  await testPluginStreamingReturnsImmediately();
+  console.log('\nselftest ok');
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+
+
+
+
+
+
+

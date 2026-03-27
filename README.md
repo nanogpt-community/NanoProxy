@@ -1,125 +1,109 @@
 # NanoProxy
 
-NanoProxy is a bridge layer for NanoGPT when native tool calling is unreliable.
+NanoProxy is a local OpenAI-compatible bridge for NanoGPT that makes tool-enabled clients work more reliably by rewriting tool-enabled requests into a stricter upstream bridge protocol and translating the model output back into standard OpenAI-style `content`, `reasoning`, and `tool_calls` for the client.
 
-It sits between the client and NanoGPT, replaces fragile native tool-calling with a stricter bridge protocol, and converts the result back into normal OpenAI-style `tool_calls` for the client. That lets tools like OpenCode keep working normally even when NanoGPT would otherwise stop early, leak raw tool text, or return malformed tool output.
+It supports both:
+- an OpenCode plugin
+- a standalone local server for OpenAI-compatible tools such as Roo Code, Kilo Code, Zed, Cline-style clients, and similar editors or agents
 
-## Which mode should I use?
+By default NanoProxy uses an object bridge that asks the upstream model to emit one structured JSON turn object inside normal content. NanoProxy incrementally parses that object and converts it back into native client fields. A legacy XML bridge is still available when needed.
 
-### Use the plugin if you use OpenCode
-This is the easiest setup for OpenCode.
+It also supports optional native-first fallback for selected models through `BRIDGE_MODELS`.
 
-- No local proxy server to keep running
-- No custom provider setup
-- Keep using the normal built-in NanoGPT provider
+## What NanoProxy Does
 
-### Use the standalone server for other tools
-Use this if:
+For tool-enabled requests, NanoProxy:
+1. rewrites the upstream request into the selected bridge protocol
+2. preserves streaming where possible for reasoning, visible content, and tool calls
+3. incrementally parses the bridged model output
+4. converts it back into normal OpenAI-style response fields
+5. retries once for the specific invalid-empty bridged-turn case
 
-- you are not using OpenCode
-- your client supports an OpenAI-compatible base URL
-- you prefer a separate local proxy process
+Requests without tools pass through normally.
 
-## OpenCode Plugin Setup
+## Bridge Protocols
 
-The plugin intercepts NanoGPT API requests inside OpenCode and applies the NanoProxy bridge automatically.
+NanoProxy supports two bridge protocols for tool-enabled requests.
 
-Example config:
+### Object bridge
+
+This is the current default.
+
+NanoProxy asks the model to return one JSON turn object shaped like this:
 
 ```json
 {
-  "plugin": [
-    "file:///path/to/NanoProxy/src/plugin.mjs"
+  "v": 1,
+  "mode": "tool",
+  "message": "I will inspect the relevant files now.",
+  "tool_calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/index.js"
+      }
+    }
   ]
 }
 ```
 
-Notes:
-- Use a real absolute file path.
-- On Windows, a valid example looks like:
-  - `file:///C:/Users/you/path/to/NanoProxy/src/plugin.mjs`
-- After editing the config, restart OpenCode.
+Field meaning:
+- `v`: protocol version
+- `mode`: `tool`, `final`, or `clarify`
+- `message`: user-visible assistant text
+- `tool_calls`: tool requests when `mode` is `tool`
 
-### Plugin debug logging
+When the provider exposes reasoning separately, NanoProxy passes that through separately as reasoning content.
 
-Enable debug logging for one OpenCode run:
+### XML bridge
 
-```sh
-NANOPROXY_DEBUG=1 opencode
-```
+The XML bridge is still supported as a legacy fallback:
 
-Optional:
-- set `NANOPROXY_LOG=/path/to/file` to change the single event log file location
-- set `NANOPROXY_LOG_DIR=/path/to/folder` to change where detailed per-request debug files are written
-
-On Windows, you can also use the same persistent toggle used by the standalone server:
-
-```sh
-./toggle-debug.ps1
-```
-
-That writes a `.debug-logging` flag file in the repo. When that flag is present, both:
-- the OpenCode plugin
-- the standalone server
-
-will enable NanoProxy debug logging until you toggle it off again.
-
-When debug mode is enabled, NanoProxy also writes:
-- a single event log file
-- per-request `*-request.json`
-- raw streamed `*-stream.sse`
-- parsed `*-response.json`
-
-By default these go into:
-- event log: your system temp folder as `nanoproxy-plugin.log`
-- detailed logs: your system temp folder under `nanoproxy-plugin-logs`
-
-## Standalone Server Setup
-
-Run the server:
-
-```sh
+```powershell
+$env:BRIDGE_PROTOCOL = "xml"
 node server.js
 ```
 
-Then point your coding tool to:
+If you need it, NanoProxy can still rewrite tool-enabled requests into the older XML-style bridge and convert the result back into standard `tool_calls`.
 
-```text
-http://127.0.0.1:8787
-```
+## BRIDGE_PROTOCOL
 
-Keep using your normal NanoGPT API key in that tool.
+`BRIDGE_PROTOCOL` selects which bridge protocol NanoProxy uses after it decides to bridge a tool-enabled request.
 
-If your tool supports a custom OpenAI-compatible provider or `baseURL`, use `http://127.0.0.1:8787` there.
-
-Optional overrides:
-
-```sh
-UPSTREAM_BASE_URL=https://nano-gpt.com/api/v1
-PROXY_HOST=127.0.0.1
-PROXY_PORT=8787
-BRIDGE_MODELS="zai-org/glm-5,moonshotai/kimi-k2.5:thinking" # Optional: bridge only these model IDs (or substrings of them) directly
-node server.js
-```
-
-## Optional: BRIDGE_MODELS
-
-`BRIDGE_MODELS` changes which models use the bridge immediately and which models try native-first with bridge fallback.
-
-- Not set: current default behavior. All tool-enabled requests are bridged immediately.
-- `BRIDGE_MODELS=""` (empty): all tool-enabled models try native-first, and fall back to the bridge if native output looks bad.
-- `BRIDGE_MODELS="zai-org/glm-5,moonshotai/kimi-k2.5:thinking"`: only matching models are bridged immediately. All other tool-enabled models try native-first with the same fallback safety net.
-
-Use model IDs, or substrings of model IDs, not display names. For example:
-- `zai-org/glm-5` or `glm-5`
-- `moonshotai/kimi-k2.5:thinking` or `kimi-k2.5`
-
-Set it in the environment that starts NanoProxy:
-- OpenCode plugin mode: set it before launching OpenCode
-- Standalone server mode: set it before running `node server.js`
-- Docker: set it in `docker-compose.yml` or with `docker run -e BRIDGE_MODELS=...`
+- not set: use `object`
+- `object`: use the object bridge
+- `xml`: use the legacy XML bridge
 
 Examples:
+
+```powershell
+$env:BRIDGE_PROTOCOL = "object"
+opencode
+```
+
+```powershell
+$env:BRIDGE_PROTOCOL = "xml"
+node server.js
+```
+
+```sh
+BRIDGE_PROTOCOL=object node server.js
+```
+
+## Native-First Fallback and BRIDGE_MODELS
+
+`BRIDGE_MODELS` decides which models bridge immediately and which models try native mode first.
+
+- not set: all tool-enabled requests bridge immediately
+- set to an empty string: all tool-enabled requests try native-first, then fall back to the selected bridge protocol if needed
+- set to a comma-separated list: matching models bridge immediately, other tool-enabled requests use native-first
+
+Examples:
+
+```powershell
+$env:BRIDGE_MODELS = ""
+node server.js
+```
 
 ```powershell
 $env:BRIDGE_MODELS = "glm-5,kimi-k2.5"
@@ -130,25 +114,103 @@ opencode
 BRIDGE_MODELS="glm-5,kimi-k2.5" node server.js
 ```
 
-### Server debug logging
+Matching is substring-based against the model id.
 
-Off by default.
+## OpenCode Plugin Setup
+
+Configure OpenCode to load the plugin:
+
+```json
+{
+  "plugin": [
+    "file:///path/to/NanoProxy/src/plugin.mjs"
+  ]
+}
+```
+
+Windows example:
+
+```json
+{
+  "plugin": [
+    "file:///C:/Users/you/path/to/NanoProxy/src/plugin.mjs"
+  ]
+}
+```
+
+Then restart OpenCode.
+
+### Plugin logging
+
+Plugin logging is off by default.
+
+Enable the structured session log for one run:
+
+```powershell
+$env:NANOPROXY_DEBUG = "1"
+opencode
+```
+
+Enable raw request and response artifacts too:
+
+```powershell
+$env:NANOPROXY_DEBUG = "1"
+$env:NANOPROXY_RAW_LOGS = "1"
+opencode
+```
+
+Optional override:
+- `NANOPROXY_LOG_DIR` for the plugin log directory
+
+Default plugin log locations:
+- session logs: system temp under `nanoproxy-plugin-logs`
+- raw artifacts: system temp under `nanoproxy-plugin-logs/raw` when raw logging is enabled
+
+The `.debug-logging` file also enables debug logging.
+
+## Standalone Server Setup
+
+Start the server:
+
+```sh
+node server.js
+```
+
+Default address:
+
+```text
+http://127.0.0.1:8787
+```
+
+Environment variables:
+
+```sh
+UPSTREAM_BASE_URL=https://nano-gpt.com/api/v1
+PROXY_HOST=127.0.0.1
+PROXY_PORT=8787
+BRIDGE_PROTOCOL=object
+BRIDGE_MODELS="glm-5,kimi-k2.5"
+node server.js
+```
+
+### Server logging
+
+Server logging is off by default.
 
 Enable for one run:
 
-```sh
-NANO_PROXY_DEBUG=1 node server.js
+```powershell
+$env:NANO_PROXY_DEBUG = "1"
+node server.js
 ```
 
 Or toggle persistently on Windows:
 
-```sh
+```powershell
 ./toggle-debug.ps1
 ```
 
-That same toggle also enables plugin debug logging.
-
-Server logs are written to `Logs/`.
+Server logs are written to `Logs/` as one structured session log per server run.
 
 ### Health check
 
@@ -156,13 +218,29 @@ Server logs are written to `Logs/`.
 curl http://127.0.0.1:8787/health
 ```
 
+Example response:
+
+```json
+{
+  "ok": true,
+  "mode": "object-bridge",
+  "port": 8787,
+  "upstream": "https://nano-gpt.com/api/v1",
+  "debugLogs": false
+}
+```
+
+When debug logs are enabled, the response also includes `logDir`.
+
 ## Docker
 
-If you want to run the standalone server in Docker instead of running Node directly:
+NanoProxy server mode works in Docker.
+
+Build and run:
 
 ```sh
-docker build -t nano-proxy .
-docker run --rm -p 8787:8787 nano-proxy
+docker build -t nanoproxy .
+docker run --rm -p 8787:8787 nanoproxy
 ```
 
 Or with Compose:
@@ -171,102 +249,64 @@ Or with Compose:
 docker compose up --build
 ```
 
-If you want to control bridge-vs-native behavior in Docker, set `BRIDGE_MODELS` in `docker-compose.yml` or with `docker run -e BRIDGE_MODELS=...`.
+Compose uses the same environment model as the server, so you can add values like `BRIDGE_PROTOCOL`, `BRIDGE_MODELS`, or `NANO_PROXY_DEBUG` there when needed.
 
-This still exposes the proxy at:
+## Logging Summary
 
-```text
-http://127.0.0.1:8787
-```
+### Plugin mode
+- off by default
+- enabled by `NANOPROXY_DEBUG=1|true` or `.debug-logging`
+- raw artifacts additionally enabled by `NANOPROXY_RAW_LOGS=1|true`
+- logs go to the temp folder under `nanoproxy-plugin-logs`
+- one structured session log per plugin run
 
-## What NanoProxy actually does
+### Server mode
+- off by default
+- enabled by `NANO_PROXY_DEBUG=1|true` or `.debug-logging`
+- logs go to `Logs/`
+- one structured session log per server run
 
-For tool-enabled requests:
+## Reliability Rules
 
-1. It removes the normal native tool-calling structure before sending the request upstream.
-2. It tells the model to use a stricter text-based tool format instead.
-3. It watches the model output.
-4. It converts that output back into normal OpenAI-style `tool_calls`.
+Key behavior:
+- bridge activates only for tool-enabled requests
+- requests without tools pass through unchanged
+- object bridge is the default and XML remains available as a fallback protocol
+- bridged output is converted back into normal OpenAI-style response fields
+- invalid empty bridged turns are treated as protocol failures, not silent successes
+- NanoProxy performs one retry for the specific invalid-empty bridged-turn case: no visible content and no tool call
+- native-first passthrough is accepted only when the upstream response already looks structurally valid
+- idle bridged SSE streams send keepalive comment frames so clients do not time out as quickly
 
-So your client still sees normal tool calls, but NanoGPT does not have to rely on its native tool-calling behavior.
-
-## Bridge format
-
-NanoProxy asks the model to emit a strict text envelope, then converts that back into normal OpenAI-style `tool_calls`.
-
-Important:
-- The actual tool names and argument keys come from your client/tool schema.
-- The examples below are format examples only.
-
-Tool reply:
-
-```text
-[[OPENCODE_TOOL]]
-[[CALL]]
-{"name": "bash", "arguments": {"command": "pwd", "description": "Print working directory"}}
-[[/CALL]]
-[[/OPENCODE_TOOL]]
-```
-
-Multiple independent tool calls in one turn:
-
-```text
-[[OPENCODE_TOOL]]
-[[CALL]]
-{"name": "read", "arguments": {"filePath": "README.md"}}
-[[/CALL]]
-[[CALL]]
-{"name": "write", "arguments": {"filePath": "notes.txt", "content": "hello"}}
-[[/CALL]]
-[[/OPENCODE_TOOL]]
-```
-
-Final answer:
-
-```text
-[[OPENCODE_FINAL]]
-Your answer here.
-[[/OPENCODE_FINAL]]
-```
-
-## Notes
-
-- Requests without tools are forwarded unchanged.
-- Reasoning streams live.
-- Tool and final content are buffered until NanoProxy can classify them safely.
-- By default, NanoProxy allows up to 5 tool calls in a single assistant turn for models that behave well with batching.
-- Some models may still behave better with one tool call per turn.
-- NanoProxy accepts both wrapped tool blocks and looser marker variants when recovering malformed output.
-- If the model emits an unparseable tool envelope, NanoProxy does a one-shot recovery retry instead of just leaking the raw block to the client.
-- For string-heavy tool arguments, NanoProxy may instruct the model to use base64 helper fields such as `command_b64` or `content_b64` when that better preserves payload integrity.
-
-## Project Structure
+## Repo Structure
 
 ```text
 NanoProxy/
+|-- Dockerfile
+|-- docker-compose.yml
+|-- package.json
+|-- README.md
+|-- selftest.js
 |-- server.js
 |-- src/
 |   |-- core.js
+|   |-- object_bridge.js
 |   `-- plugin.mjs
-|-- selftest.js
-|-- README.md
-|-- package.json
-|-- Dockerfile
-`-- docker-compose.yml
+`-- toggle-debug.ps1
 ```
 
 ## Verification
 
 ```sh
-node --check server.js
 node --check src/core.js
+node --check src/object_bridge.js
 node --check src/plugin.mjs
+node --check server.js
 node selftest.js
 ```
 
-## License
+Or:
 
-MIT
-
-
-
+```sh
+npm run check
+```

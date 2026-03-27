@@ -1,8 +1,8 @@
 {
   "name": "nanoproxy",
   "private": false,
-  "version": "1.1.0",
-  "description": "Local OpenAI-compatible proxy and OpenCode plugin that bridges tool calls for NanoGPT when native tool calling is unreliable.",
+  "version": "2.0.0",
+  "description": "Local OpenAI-compatible NanoGPT bridge with XML tool calling, OpenCode plugin support, native-first fallback, and standalone server mode.",
   "type": "commonjs",
   "main": "./src/plugin.mjs",
   "exports": {
@@ -12,12 +12,14 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node selftest.js"
+    "check": "node --check src/core.js && node --check src/plugin.mjs && node --check server.js && node selftest.js",
+    "selftest": "node selftest.js"
   },
   "keywords": [
     "opencode",
     "nanogpt",
     "tool-bridge",
+    "xml",
     "proxy",
     "llm",
     "ai"

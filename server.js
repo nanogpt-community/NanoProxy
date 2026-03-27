@@ -1,70 +1,47 @@
 "use strict";
 
 const http = require("node:http");
-const { URL } = require("node:url");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-
-// Import core transformation logic from extracted module
 const core = require("./src/core.js");
 
-// Destructure needed functions
 const {
-  requestNeedsBridge,
-  transformRequestForBridge,
-  parseBridgeAssistantText,
-  parseSSETranscript,
-  buildBridgeResultFromText,
-  buildChatCompletionFromBridge,
-  buildSSEFromBridge,
-  buildEmptyStopRecoveryRequest,
-  buildInvalidToolBlockRecoveryRequest,
-  isEmptyBridgeStopAggregate,
-  extractProgressiveToolCalls,
-  sseLine,
-  applyChunkToAggregate,
-  detectBridgeStreamMode,
-  extractStreamableFinalContent,
   tryParseJson,
-  tryParseJsonLenient,
-  clone,
-  MAX_TOOL_CALLS_PER_TURN,
+  requestNeedsBridge,
+  requestNeedsXmlBridge,
+  transformRequestForBridge,
+  buildAggregateFromChatCompletion,
+  buildChatCompletionFromBridge,
   acceptNativeJson,
   acceptNativeSSE,
-  buildToolArgumentKeyMap,
-  buildToolRequiredKeyMap
+  sseLine,
+  createStreamingBridgeParser,
+  buildBridgeResultFromText,
+  getBridgeProtocol
 } = core;
 
 const LISTEN_HOST = process.env.PROXY_HOST || "127.0.0.1";
 const LISTEN_PORT = Number(process.env.PROXY_PORT || "8787");
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || "https://nano-gpt.com/api/v1";
 const DEBUG_FLAG_FILE = path.join(__dirname, ".debug-logging");
-const ENABLE_DEBUG_LOGS = process.env.NANO_PROXY_DEBUG === "1" || fs.existsSync(DEBUG_FLAG_FILE);
+const ENABLE_DEBUG_LOGS = process.env.NANO_PROXY_DEBUG === "1" || process.env.NANO_PROXY_DEBUG === "true" || fs.existsSync(DEBUG_FLAG_FILE);
 const LOG_DIR = path.join(__dirname, "Logs");
-const ACTIVITY_LOG = path.join(LOG_DIR, "activity.log");
-const SSE_HEARTBEAT_INTERVAL_MS = 15000;
 
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+if (ENABLE_DEBUG_LOGS) fs.mkdirSync(LOG_DIR, { recursive: true });
+const SESSION_START = new Date().toISOString().replace(/[:.]/g, "-");
+const SESSION_LOG = ENABLE_DEBUG_LOGS ? path.join(LOG_DIR, `session-${SESSION_START}.log`) : null;
+let requestCounter = 0;
+
+function log(text) {
+  if (!ENABLE_DEBUG_LOGS || !SESSION_LOG) return;
+  fs.appendFileSync(SESSION_LOG, text + "\n", "utf8");
 }
 
-function appendActivity(line) {
-  if (!ENABLE_DEBUG_LOGS) return;
-  ensureDir(LOG_DIR);
-  fs.appendFileSync(ACTIVITY_LOG, `${new Date().toISOString()} ${line}\n`, "utf8");
-}
-
-function writeJsonLog(filePath, payload) {
-  if (!ENABLE_DEBUG_LOGS) return;
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf8");
-}
-
-function appendTextLog(filePath, text) {
-  if (!ENABLE_DEBUG_LOGS) return;
-  ensureDir(path.dirname(filePath));
-  fs.appendFileSync(filePath, text, "utf8");
+function logSection(title, content) {
+  log(`--- ${title} ---`);
+  log(typeof content === "string" ? content : JSON.stringify(content, null, 2));
+  log("");
 }
 
 function nowStamp() {
@@ -87,15 +64,13 @@ function buildUpstreamUrl(requestPath) {
 
 async function readRequestBody(req) {
   const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.from(chunk));
-  }
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
 
 function buildUpstreamHeaders(reqHeaders, bodyLength) {
   const headers = new Headers();
-  for (const [key, value] of Object.entries(reqHeaders)) {
+  for (const [key, value] of Object.entries(reqHeaders || {})) {
     if (key.toLowerCase() === "host") continue;
     if (Array.isArray(value)) headers.set(key, value.join(", "));
     else if (value !== undefined) headers.set(key, value);
@@ -107,86 +82,74 @@ function buildUpstreamHeaders(reqHeaders, bodyLength) {
 function copyResponseHeaders(upstreamHeaders, res, bodyLength) {
   upstreamHeaders.forEach((value, key) => {
     const lower = key.toLowerCase();
-    if (lower === "content-length") return;
-    if (lower === "content-encoding") return;
-    if (lower === "transfer-encoding") return;
+    if (lower === "content-length" || lower === "content-encoding" || lower === "transfer-encoding") return;
     res.setHeader(key, value);
   });
-  if (bodyLength !== undefined) {
-    res.setHeader("content-length", String(bodyLength));
-  }
+  if (bodyLength !== undefined) res.setHeader("content-length", String(bodyLength));
+}
+
+async function fetchUpstream(req, upstreamUrl, bodyBuffer) {
+  return fetch(upstreamUrl, {
+    method: req.method,
+    headers: buildUpstreamHeaders(req.headers, bodyBuffer.length),
+    body: ["GET", "HEAD"].includes(req.method) ? undefined : bodyBuffer
+  });
+}
+
+function buildInvalidBridgeRetryBuffer(rewrittenBody, protocol = "xml") {
+  const retryBody = JSON.parse(JSON.stringify(rewrittenBody));
+  retryBody.messages = Array.isArray(retryBody.messages) ? retryBody.messages.slice() : [];
+  const content = protocol === "object"
+    ? "Your previous response was invalid because it contained no visible content or tool call. Return exactly one valid JSON turn object that matches the required bridge contract. Do not return an empty response."
+    : "Your previous response was invalid because it contained no visible content and no XML tool call. Do not return an empty response. If you need to act, emit the XML tool call now. If no tool is needed, provide a normal visible reply.";
+  retryBody.messages.push({ role: "system", content });
+  return Buffer.from(JSON.stringify(retryBody), "utf8");
 }
 
 async function proxyRequest(req, res) {
+  if (req.method === "GET" && req.url === "/health") {
+    const payload = { ok: true, mode: `${getBridgeProtocol()}-bridge`, port: LISTEN_PORT, upstream: UPSTREAM_BASE_URL, debugLogs: ENABLE_DEBUG_LOGS };
+    if (ENABLE_DEBUG_LOGS) payload.logDir = LOG_DIR;
+    const body = JSON.stringify(payload);
+    res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+    res.end(body);
+    return;
+  }
+
+  requestCounter++;
+  const reqNum = requestCounter;
   const requestId = `${nowStamp()}-${randomUUID().slice(0, 8)}`;
   const upstreamUrl = buildUpstreamUrl(req.url);
-  const streamLogPath = path.join(LOG_DIR, `${requestId}-stream.sse`);
   const reqBuffer = await readRequestBody(req);
   const reqText = reqBuffer.toString("utf8");
-  const reqParsed = tryParseJson(reqText);
-
-  appendActivity(`request.start id=${requestId} method=${req.method} path=${req.url}`);
-
-  const requestLog = {
-    id: requestId,
-    time: new Date().toISOString(),
-    method: req.method,
-    path: req.url,
-    upstreamUrl: upstreamUrl.toString(),
-    headers: redactHeaders(req.headers)
-  };
+  const parsed = tryParseJson(reqText);
+  const isJson = (req.headers["content-type"] || "").includes("application/json") && parsed.ok;
 
   let upstreamBuffer = reqBuffer;
   let bridgeMeta = null;
-  
-  // 1. Check if the user opted this model into native-first
-  const isJsonRequest = (req.headers["content-type"] || "").includes("application/json") && reqText && reqParsed.ok;
   let attemptNativeFirst = false;
-  
-  if (isJsonRequest && reqParsed.value && typeof reqParsed.value === "object" && Array.isArray(reqParsed.value.tools) && reqParsed.value.tools.length > 0) {
-    if (!core.requestNeedsBridge(reqParsed.value)) {
-      // The core logic (modelNeedsBridge) says this model is exempt from the default bridge.
-      // So we will try it natively first, and fallback if it fails.
-      attemptNativeFirst = true;
-    }
+
+  if (isJson && requestNeedsXmlBridge(parsed.value) && !requestNeedsBridge(parsed.value)) {
+    attemptNativeFirst = true;
   }
 
-  // 2. If it is NOT a native-first attempt, apply the bridge immediately (Default Fast Path)
-  if (isJsonRequest && !attemptNativeFirst) {
-    requestLog.requestBodyOriginal = reqParsed.value;
-    const transformed = transformRequestForBridge(reqParsed.value, { forceBridge: true });
-    requestLog.requestChanges = transformed.changes;
-    requestLog.requestBodyRewritten = transformed.rewritten;
-    bridgeMeta = {
-      bridgeApplied: transformed.bridgeApplied,
-      originalRequest: reqParsed.value,
-      upstreamRequest: transformed.rewritten,
-      normalizedTools: transformed.normalizedTools
-    };
-    if (transformed.bridgeApplied || transformed.changes.length > 0) {
-      upstreamBuffer = Buffer.from(JSON.stringify(transformed.rewritten), "utf8");
-    }
-  } else if (reqText) {
-    requestLog.requestBodyOriginalText = reqText;
+  log(`\n${"=".repeat(80)}`);
+  log(`REQUEST #${reqNum}  |  ${new Date().toISOString()}  |  ${req.method} ${req.url}`);
+  log(`${"=".repeat(80)}`);
+  if (ENABLE_DEBUG_LOGS) logSection("REQUEST HEADERS", redactHeaders(req.headers));
+
+  if (isJson && requestNeedsXmlBridge(parsed.value) && !attemptNativeFirst) {
+    bridgeMeta = transformRequestForBridge(parsed.value);
+    upstreamBuffer = Buffer.from(JSON.stringify(bridgeMeta.rewritten), "utf8");
+    log(`--- BRIDGE ACTIVE | Tools: [${bridgeMeta.toolNames.join(", ")}] ---\n`);
+  } else if (attemptNativeFirst) {
+    log(`--- NATIVE-FIRST ACTIVE | Model: ${parsed.value && parsed.value.model ? parsed.value.model : "(unknown)"} ---\n`);
   }
 
-  writeJsonLog(path.join(LOG_DIR, `${requestId}-request.json`), requestLog);
+  let upstreamResponse = await fetchUpstream(req, upstreamUrl, upstreamBuffer);
+  let contentType = upstreamResponse.headers.get("content-type") || "";
 
-  // 3. Send the request upstream
-  let upstreamResponse = await fetch(upstreamUrl, {
-    method: req.method,
-    headers: buildUpstreamHeaders(req.headers, upstreamBuffer.length),
-    body: ["GET", "HEAD"].includes(req.method) ? undefined : upstreamBuffer
-  });
-
-  // 4. If this was a native-first attempt, validate the response BEFORE streaming it
   if (attemptNativeFirst) {
-    appendActivity(`request.native_attempt id=${requestId} status=${upstreamResponse.status}`);
-    const contentType = upstreamResponse.headers.get("content-type") || "";
-  const parseOptions = {
-    toolArgKeyMap: buildToolArgumentKeyMap((bridgeMeta && Array.isArray(bridgeMeta.normalizedTools)) ? bridgeMeta.normalizedTools : []),
-    toolRequiredKeyMap: buildToolRequiredKeyMap((bridgeMeta && Array.isArray(bridgeMeta.normalizedTools)) ? bridgeMeta.normalizedTools : [])
-  };
     let nativeSucceeded = false;
     let bufferedBody = null;
     let bufferedText = "";
@@ -199,21 +162,21 @@ async function proxyRequest(req, res) {
       } else if (contentType.includes("application/json")) {
         bufferedText = await upstreamResponse.text();
         bufferedBody = Buffer.from(bufferedText, "utf8");
-        const parsedJson = tryParseJson(bufferedText);
-        if (parsedJson.ok) {
-          nativeSucceeded = acceptNativeJson(upstreamResponse.status, parsedJson.value);
-        }
+        const nativeParsed = tryParseJson(bufferedText);
+        nativeSucceeded = nativeParsed.ok && acceptNativeJson(upstreamResponse.status, nativeParsed.value);
       } else if (upstreamResponse.status >= 200 && upstreamResponse.status < 300) {
-        nativeSucceeded = true; 
         bufferedBody = Buffer.from(await upstreamResponse.arrayBuffer());
+        nativeSucceeded = true;
       }
-    } catch (e) {
+    } catch (_) {
       nativeSucceeded = false;
     }
 
+    log(`--- NATIVE-FIRST RESULT ---`);
+    log(nativeSucceeded ? "accepted" : "rejected; falling back to xml bridge");
+    log("");
+
     if (nativeSucceeded) {
-      // Native attempt succeeded! Serve the buffered response to the client.
-      appendActivity(`request.native_success id=${requestId}`);
       copyResponseHeaders(upstreamResponse.headers, res, bufferedBody ? bufferedBody.length : undefined);
       res.writeHead(upstreamResponse.status);
       if (bufferedBody) res.end(bufferedBody);
@@ -221,435 +184,360 @@ async function proxyRequest(req, res) {
       return;
     }
 
-    // Native attempt FAILED. Fallback to the Bridge.
-    appendActivity(`request.native_failed_fallback id=${requestId}`);
-    
-    requestLog.requestChanges = ["native_attempt_failed", "fallback_to_bridge"];
-    const transformed = transformRequestForBridge(reqParsed.value, { forceBridge: true });
-    requestLog.requestBodyRewritten = transformed.rewritten;
-    bridgeMeta = {
-      bridgeApplied: transformed.bridgeApplied,
-      originalRequest: reqParsed.value,
-      upstreamRequest: transformed.rewritten,
-      normalizedTools: transformed.normalizedTools
-    };
-    upstreamBuffer = Buffer.from(JSON.stringify(transformed.rewritten), "utf8");
-    
-    // Execute the SECOND request (The fallback)
-    upstreamResponse = await fetch(upstreamUrl, {
-      method: req.method,
-      headers: buildUpstreamHeaders(req.headers, upstreamBuffer.length),
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : upstreamBuffer
-    });
+    bridgeMeta = transformRequestForBridge(parsed.value);
+    upstreamBuffer = Buffer.from(JSON.stringify(bridgeMeta.rewritten), "utf8");
+    log(`--- BRIDGE ACTIVE | Tools: [${bridgeMeta.toolNames.join(", ")}] ---\n`);
+    upstreamResponse = await fetchUpstream(req, upstreamUrl, upstreamBuffer);
+    contentType = upstreamResponse.headers.get("content-type") || "";
   }
 
-  const contentType = upstreamResponse.headers.get("content-type") || "";
-  const parseOptions = {
-    toolArgKeyMap: buildToolArgumentKeyMap((bridgeMeta && Array.isArray(bridgeMeta.normalizedTools)) ? bridgeMeta.normalizedTools : []),
-    toolRequiredKeyMap: buildToolRequiredKeyMap((bridgeMeta && Array.isArray(bridgeMeta.normalizedTools)) ? bridgeMeta.normalizedTools : [])
-  };
-  if (contentType.includes("text/event-stream")) {
-    appendActivity(`request.stream_buffered id=${requestId} status=${upstreamResponse.status}`);
-    appendTextLog(
-      streamLogPath,
-      [
-        `# request_id=${requestId}`,
-        `# time=${new Date().toISOString()}`,
-        `# path=${req.url}`,
-        `# upstream=${upstreamUrl}`,
-        `# status=${upstreamResponse.status}`,
-        ""
-      ].join("\n")
-    );
+  if (!upstreamResponse.ok) {
+    log(`--- UPSTREAM ERROR ${upstreamResponse.status} ${upstreamResponse.statusText} ---`);
+    try {
+      const errBody = await upstreamResponse.clone().text();
+      log(errBody.substring(0, 2000));
+    } catch (_) {}
+    log("");
+  }
 
-    if (!(bridgeMeta && bridgeMeta.bridgeApplied)) {
-      const streamText = await upstreamResponse.text();
-      appendTextLog(streamLogPath, streamText);
-      res.setHeader("content-type", "text/event-stream; charset=utf-8");
-      res.setHeader("cache-control", "no-cache");
-      res.setHeader("connection", "keep-alive");
-      res.setHeader("content-length", Buffer.byteLength(streamText));
-      res.writeHead(upstreamResponse.status);
-      res.end(streamText);
-      appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_passthrough stream_log=${path.basename(streamLogPath)}`);
-      return;
-    }
+  if (bridgeMeta && upstreamResponse.ok && contentType.includes("text/event-stream")) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive"
+    });
 
-    res.setHeader("content-type", "text/event-stream; charset=utf-8");
-    res.setHeader("cache-control", "no-cache");
-    res.setHeader("connection", "keep-alive");
-    res.writeHead(upstreamResponse.status);
-
-    let rawBuffer = "";
-    let roleSent = false;
-    let reasoningSent = 0;
-    let emittedToolCalls = 0;
-    let streamClosed = false;
-    let lastDownstreamWriteAt = Date.now();
-    let heartbeatTimer = null;
-
-    const writeDownstream = (text) => {
-      if (streamClosed) return;
-      res.write(text);
-      lastDownstreamWriteAt = Date.now();
+    const id = "chatcmpl_" + randomUUID();
+    let model = "nanoproxy";
+    let created = Math.floor(Date.now() / 1000);
+    const SSE_HEARTBEAT_INTERVAL_MS = 15000;
+    let lastSseWriteAt = Date.now();
+    const writeSse = (payload) => {
+      lastSseWriteAt = Date.now();
+      return res.write(sseLine(payload));
     };
-
-    const stopHeartbeat = () => {
-      if (!heartbeatTimer) return;
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
+    const writeSseComment = (text) => {
+      lastSseWriteAt = Date.now();
+      return res.write(`: ${text}\n\n`);
     };
-
-    heartbeatTimer = setInterval(() => {
-      if (streamClosed) return;
-      if (Date.now() - lastDownstreamWriteAt < SSE_HEARTBEAT_INTERVAL_MS) return;
-      try {
-        res.write(": keepalive\n\n");
-        lastDownstreamWriteAt = Date.now();
-      } catch (e) {}
+    const heartbeatTimer = setInterval(() => {
+      if (res.destroyed || res.writableEnded) return;
+      if (Date.now() - lastSseWriteAt < SSE_HEARTBEAT_INTERVAL_MS) return;
+      try { writeSseComment("keepalive"); } catch (_) {}
     }, SSE_HEARTBEAT_INTERVAL_MS);
     if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
 
-    const ensureRole = (aggregate) => {
-      if (roleSent) return;
-      writeDownstream(sseLine({
-        id: aggregate.id || `chatcmpl_${randomUUID()}`,
-        object: "chat.completion.chunk",
-        created: aggregate.created || Math.floor(Date.now() / 1000),
-        model: aggregate.model || "tool-bridge",
-        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
-      }));
-      roleSent = true;
-    };
+    writeSse({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+    });
 
-    const flushReasoningDelta = (aggregate) => {
-      if (aggregate.reasoning.length <= reasoningSent) return;
-      const deltaText = aggregate.reasoning.slice(reasoningSent);
-      reasoningSent = aggregate.reasoning.length;
-      ensureRole(aggregate);
-      writeDownstream(sseLine({
-        id: aggregate.id || `chatcmpl_${randomUUID()}`,
-        object: "chat.completion.chunk",
-        created: aggregate.created || Math.floor(Date.now() / 1000),
-        model: aggregate.model || "tool-bridge",
-        choices: [{ index: 0, delta: { reasoning: deltaText }, finish_reason: null }]
-      }));
-    };
-
-    const flushProgressiveToolCalls = (aggregate) => {
-      const progressiveCalls = extractProgressiveToolCalls(aggregate.content, parseOptions);
-      if (progressiveCalls.length <= emittedToolCalls) return;
-      ensureRole(aggregate);
-      for (let i = emittedToolCalls; i < progressiveCalls.length; i++) {
-        const call = progressiveCalls[i];
-        writeDownstream(sseLine({
-          id: aggregate.id || `chatcmpl_${randomUUID()}`,
-          object: "chat.completion.chunk",
-          created: aggregate.created || Math.floor(Date.now() / 1000),
-          model: aggregate.model || "tool-bridge",
-          choices: [{
-            index: 0,
-            delta: {
-              tool_calls: [{
-                index: i,
-                id: call.id,
-                type: "function",
-                function: {
-                  name: call.function.name,
-                  arguments: call.function.arguments
-                }
-              }]
-            },
-            finish_reason: null
-          }]
-        }));
+    const STRIP_TAGS = ["<open>", "</open>"];
+    let stripBuf = "";
+    function emitContent(text) {
+      writeSse({
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+      });
+    }
+    function feedContent(char) {
+      if (stripBuf.length > 0) {
+        stripBuf += char;
+        let couldMatch = false;
+        let exactMatch = false;
+        for (const tag of STRIP_TAGS) {
+          if (tag.startsWith(stripBuf)) couldMatch = true;
+          if (tag === stripBuf) exactMatch = true;
+        }
+        if (exactMatch) {
+          stripBuf = "";
+        } else if (!couldMatch) {
+          for (const c of stripBuf) emitContent(c);
+          stripBuf = "";
+        }
+      } else if (char === "<") {
+        stripBuf = "<";
+      } else {
+        emitContent(char);
       }
-      emittedToolCalls = progressiveCalls.length;
-    };
+    }
+    function flushStripBuf() {
+      if (stripBuf.length > 0) {
+        let exactMatch = false;
+        for (const tag of STRIP_TAGS) {
+          if (tag === stripBuf) exactMatch = true;
+        }
+        if (!exactMatch) {
+          for (const c of stripBuf) emitContent(c);
+        }
+        stripBuf = "";
+      }
+    }
 
-    let aggregate = {
-      id: null,
-      model: null,
-      created: null,
-      reasoning: "",
-      content: "",
-      finishReason: null,
-      usage: undefined
-    };
+    const retryBuffer = buildInvalidBridgeRetryBuffer(bridgeMeta.rewritten, bridgeMeta.protocol);
+    let activeResponse = upstreamResponse;
+    let activeContentType = contentType;
+    let finalToolIndex = 0;
+    let finalFinishReason = null;
+    let invalidNotice = null;
 
-    const consumeBridgeStream = async (response, logLabel) => {
-      rawBuffer = "";
-      for await (const chunk of response.body) {
-        const textChunk = Buffer.from(chunk).toString("utf8");
-        appendTextLog(streamLogPath, textChunk);
-        rawBuffer += textChunk;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!(activeResponse.ok && activeContentType.includes("text/event-stream"))) break;
+      if (attempt > 0) {
+        log(`--- RETRY ATTEMPT #${attempt + 1} ---`);
+        log("");
+      }
 
-        let boundary;
-        while ((boundary = rawBuffer.indexOf("\n\n")) !== -1) {
-          const eventText = rawBuffer.slice(0, boundary);
-          rawBuffer = rawBuffer.slice(boundary + 2);
-          const line = eventText
-            .split(/\r?\n/)
-            .map((part) => part.trim())
-            .find((part) => part.startsWith("data:"));
-          if (!line) continue;
-          const payload = line.slice(5).trim();
-          if (!payload || payload === "[DONE]") continue;
-          const parsed = tryParseJson(payload);
-          if (!parsed.ok) continue;
+      const parser = createStreamingBridgeParser(bridgeMeta.normalizedTools, {
+        onContent: (text) => {
+          if (bridgeMeta.protocol === "object") emitContent(text);
+          else for (const c of text) feedContent(c);
+        },
+        onToolCall: (call, index) => {
+          flushStripBuf();
+          writeSse({
+            id, object: "chat.completion.chunk", created, model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index,
+                  id: call.id,
+                  type: "function",
+                  function: { name: call.function.name, arguments: call.function.arguments }
+                }]
+              },
+              finish_reason: null
+            }]
+          });
+        }
+      });
 
-          applyChunkToAggregate(aggregate, parsed.value);
-          flushReasoningDelta(aggregate);
-          flushProgressiveToolCalls(aggregate);
+      let rawContent = "";
+      let rawThinking = "";
+      let openTagCount = 0;
+      let buffer = "";
+      let upstreamFinishReason = null;
+      const decoder = new TextDecoder("utf-8");
+      const processSseBlock = (block) => {
+        const lines = String(block || "").split(/\r?\n/).filter((l) => l.startsWith("data:"));
+        for (const line of lines) {
+          const payloadStr = line.slice(5).trim();
+          if (!payloadStr || payloadStr === "[DONE]") continue;
+          const parsedPayload = tryParseJson(payloadStr);
+          if (!parsedPayload.ok) continue;
 
-          if (emittedToolCalls >= MAX_TOOL_CALLS_PER_TURN) {
-            aggregate.finishReason = "tool_calls_max_cap";
-            try { response.body.destroy(); } catch (e) { }
-            break;
+          const payload = parsedPayload.value;
+          if (payload.model) model = payload.model;
+          if (payload.created) created = payload.created;
+          const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+          if (!choice) continue;
+          if (choice.finish_reason != null) upstreamFinishReason = choice.finish_reason;
+          const delta = choice.delta || {};
+
+          if (delta.reasoning || delta.reasoning_content) {
+            rawThinking += (delta.reasoning || delta.reasoning_content);
+            writeSse({
+              id, object: "chat.completion.chunk", created, model,
+              choices: [{ index: 0, delta: { reasoning: delta.reasoning || delta.reasoning_content }, finish_reason: null }]
+            });
+          }
+
+          if (delta.content) {
+            rawContent += delta.content;
+            if (bridgeMeta.protocol === "xml") {
+              const openMatches = delta.content.match(/<open>/g);
+              if (openMatches) openTagCount += openMatches.length;
+            }
+            parser.feed(delta.content);
           }
         }
-        if (emittedToolCalls >= MAX_TOOL_CALLS_PER_TURN) break;
+      };
+
+      for await (const chunk of activeResponse.body) {
+        const textChunk = decoder.decode(chunk, { stream: true });
+        buffer += textChunk;
+        const parts = buffer.split(/\n\n+/);
+        buffer = parts.pop();
+        for (const block of parts) processSseBlock(block);
       }
-      appendActivity(`request.stream_consumed id=${requestId} label=${logLabel} finish=${aggregate.finishReason || "null"} reasoning_len=${aggregate.reasoning.length} content_len=${aggregate.content.length}`);
-    };
+      if (buffer.trim()) processSseBlock(buffer);
 
-    await consumeBridgeStream(upstreamResponse, "initial");
+      parser.flush();
+      flushStripBuf();
+      const bridgeResult = buildBridgeResultFromText(rawContent, rawThinking, bridgeMeta.normalizedTools);
 
-    if (isEmptyBridgeStopAggregate(aggregate)) {
-      appendActivity(`request.empty_stop id=${requestId}`);
-      const recoveryRequest = buildEmptyStopRecoveryRequest(bridgeMeta.upstreamRequest);
-      const recoveryBuffer = Buffer.from(JSON.stringify(recoveryRequest), "utf8");
-      appendTextLog(streamLogPath, "\n# recovery-attempt=1\n");
-      const recoveryResponse = await fetch(upstreamUrl, {
-        method: req.method,
-        headers: buildUpstreamHeaders(req.headers, recoveryBuffer.length),
-        body: ["GET", "HEAD"].includes(req.method) ? undefined : recoveryBuffer
-      });
-      appendActivity(`request.recovery id=${requestId} status=${recoveryResponse.status}`);
-      if ((recoveryResponse.headers.get("content-type") || "").includes("text/event-stream")) {
-        aggregate = {
-          id: null,
-          model: null,
-          created: null,
-          reasoning: "",
-          content: "",
-          finishReason: null,
-          usage: undefined
-        };
-        await consumeBridgeStream(recoveryResponse, "recovery");
+      if (rawThinking) {
+        log(`--- THINKING (${rawThinking.length} chars) ---`);
+        log(rawThinking.length > 500 ? rawThinking.substring(0, 500) + "\n... [truncated]" : rawThinking);
+        log("");
+      }
+      log(`--- CONTENT (${rawContent.length} chars) | <open> tags: ${openTagCount} ---`);
+      log(rawContent || "(empty)");
+      log("");
+      if (parser.completedCalls.length > 0) {
+        log(`--- TOOL CALLS: ${parser.completedCalls.length} ---`);
+        for (const tc of parser.completedCalls) {
+          const args = tc.function?.arguments || "";
+          const preview = args.length > 200 ? args.substring(0, 200) + "..." : args;
+          log(`  [${tc.function?.name}] id=${tc.id} args=${preview}`);
+        }
+        log("");
       } else {
-        const recoveryText = await recoveryResponse.text();
-        appendTextLog(streamLogPath, recoveryText);
+        log("--- NO TOOL CALLS ---\n");
       }
+      log(`--- UPSTREAM FINISH REASON ---`);
+      log(String(upstreamFinishReason ?? "(none)"));
+      log("");
+
+      const recoveredCalls = bridgeResult.kind === "tool_calls" && Array.isArray(bridgeResult.message?.tool_calls)
+        ? bridgeResult.message.tool_calls
+        : [];
+
+      if (bridgeResult.kind !== "invalid") {
+        if (bridgeMeta.protocol === "object" && !parser.messageEmitted && bridgeResult.message?.content) {
+          emitContent(bridgeResult.message.content);
+        }
+        if (bridgeMeta.protocol === "object" && recoveredCalls.length > parser.completedCalls.length) {
+          for (const [offset, call] of recoveredCalls.slice(parser.completedCalls.length).entries()) {
+            flushStripBuf();
+            writeSse({
+              id, object: "chat.completion.chunk", created, model,
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: parser.completedCalls.length + offset,
+                    id: call.id,
+                    type: "function",
+                    function: { name: call.function.name, arguments: call.function.arguments }
+                  }]
+                },
+                finish_reason: null
+              }]
+            });
+          }
+        }
+      }
+
+      if (bridgeResult.kind === "invalid") {
+        const notice = `[NanoProxy] Invalid bridged completion: upstream returned no visible content or tool call for a tool-enabled turn${upstreamFinishReason ? ` (finish_reason=${upstreamFinishReason})` : ""}.`;
+        if (parser.toolIndex === 0 && attempt === 0) {
+          log(`--- INVALID BRIDGE COMPLETION ---`);
+          log(`${notice} Retrying once.`);
+          log("");
+          activeResponse = await fetchUpstream(req, upstreamUrl, retryBuffer);
+          activeContentType = activeResponse.headers.get("content-type") || "";
+          continue;
+        }
+        if (parser.toolIndex === 0) {
+          log(`--- INVALID BRIDGE COMPLETION ---`);
+          log(notice);
+          log("");
+          invalidNotice = notice;
+        }
+      }
+
+      finalToolIndex = recoveredCalls.length || parser.toolIndex;
+      finalFinishReason = recoveredCalls.length > 0 ? "tool_calls" : (upstreamFinishReason || "stop");
+      break;
     }
 
-    if (!roleSent) ensureRole(aggregate);
-    let result = buildBridgeResultFromText(aggregate.content, aggregate.reasoning, parseOptions);
-    if (result.kind === "invalid_tool_block" && bridgeMeta && bridgeMeta.upstreamRequest) {
-      appendActivity(`request.invalid_tool_block id=${requestId}`);
-      const retryRequest = buildInvalidToolBlockRecoveryRequest(bridgeMeta.upstreamRequest);
-      const retryBuffer = Buffer.from(JSON.stringify(retryRequest), "utf8");
-      appendTextLog(streamLogPath, "\n# recovery-attempt=invalid_tool_block\n");
-      const retryResponse = await fetch(upstreamUrl, {
-        method: req.method,
-        headers: buildUpstreamHeaders(req.headers, retryBuffer.length),
-        body: ["GET", "HEAD"].includes(req.method) ? undefined : retryBuffer
-      });
-      appendActivity(`request.invalid_tool_recovery id=${requestId} status=${retryResponse.status}`);
-      if ((retryResponse.headers.get("content-type") || "").includes("text/event-stream")) {
-        aggregate = {
-          id: null,
-          model: null,
-          created: null,
-          reasoning: "",
-          content: "",
-          finishReason: null,
-          usage: undefined
-        };
-        emittedToolCalls = 0;
-        await consumeBridgeStream(retryResponse, "invalid_tool_recovery");
-        result = buildBridgeResultFromText(aggregate.content, aggregate.reasoning, parseOptions);
-      }
-    }
-    if (result.kind === "final" || result.kind === "invalid_tool_block") {
-      const finalText = extractStreamableFinalContent(aggregate.content) || result.message.content || "";
-      if (finalText) {
-        writeDownstream(sseLine({
-          id: aggregate.id || `chatcmpl_${randomUUID()}`,
-          object: "chat.completion.chunk",
-          created: aggregate.created || Math.floor(Date.now() / 1000),
-          model: aggregate.model || "tool-bridge",
-          choices: [{ index: 0, delta: { content: finalText }, finish_reason: null }]
-        }));
-      }
-      writeDownstream(sseLine({
-        id: aggregate.id || `chatcmpl_${randomUUID()}`,
-        object: "chat.completion.chunk",
-        created: aggregate.created || Math.floor(Date.now() / 1000),
-        model: aggregate.model || "tool-bridge",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        ...(aggregate.usage ? { usage: aggregate.usage } : {})
-      }));
-      res.write("data: [DONE]\n\n");
-      res.end();
-      appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_bridge_partial stream_log=${path.basename(streamLogPath)}`);
-      return;
-    }
+    if (invalidNotice) emitContent(invalidNotice);
 
-    for (const [index, call] of result.message.tool_calls.entries()) {
-      if (index < emittedToolCalls) continue;
-      writeDownstream(sseLine({
-        id: aggregate.id || `chatcmpl_${randomUUID()}`,
-        object: "chat.completion.chunk",
-        created: aggregate.created || Math.floor(Date.now() / 1000),
-        model: aggregate.model || "tool-bridge",
-        choices: [{
-          index: 0,
-          delta: {
-            tool_calls: [{
-              index,
-              id: call.id,
-              type: "function",
-              function: {
-                name: call.function.name,
-                arguments: call.function.arguments
-              }
-            }]
-          },
-          finish_reason: null
-        }]
-      }));
-    }
-    writeDownstream(sseLine({
-      id: aggregate.id || `chatcmpl_${randomUUID()}`,
-      object: "chat.completion.chunk",
-      created: aggregate.created || Math.floor(Date.now() / 1000),
-      model: aggregate.model || "tool-bridge",
-      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-      ...(aggregate.usage ? { usage: aggregate.usage } : {})
-    }));
+    writeSse({
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason || "stop" }]
+    });
     res.write("data: [DONE]\n\n");
+    clearInterval(heartbeatTimer);
     res.end();
-    appendActivity(`request.done id=${requestId} status=${upstreamResponse.status} type=stream_bridge_reasoning stream_log=${path.basename(streamLogPath)}`);
+    console.log(`[NanoProxy] #${reqNum} SSE done. Tool calls: ${finalToolIndex}${ENABLE_DEBUG_LOGS && SESSION_LOG ? ` | Log: ${path.basename(SESSION_LOG)}` : ""}`);
     return;
   }
 
-  const responseText = await upstreamResponse.text();
-  const responseParsed = tryParseJson(responseText);
-  const responseLog = {
-    id: requestId,
-    time: new Date().toISOString(),
-    status: upstreamResponse.status,
-    headers: redactHeaders(Object.fromEntries(upstreamResponse.headers.entries()))
-  };
+  if (bridgeMeta && upstreamResponse.ok && contentType.includes("application/json")) {
+    const retryBuffer = buildInvalidBridgeRetryBuffer(bridgeMeta.rewritten, bridgeMeta.protocol);
+    let activeResponse = upstreamResponse;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const upstreamText = await activeResponse.text();
+      const upstreamJson = tryParseJson(upstreamText);
+      if (!upstreamJson.ok) break;
 
-  let finalText = responseText;
-
-  if (responseParsed.ok) {
-    responseLog.responseBodyOriginal = responseParsed.value;
-    if (bridgeMeta && bridgeMeta.bridgeApplied) {
-      let currentResponse = responseParsed.value;
-      let choice = Array.isArray(currentResponse.choices) ? currentResponse.choices[0] : null;
-      let message = choice && choice.message ? choice.message : {};
-      let aggregate = {
-        id: currentResponse.id,
-        model: currentResponse.model,
-        created: currentResponse.created,
-        reasoning: message.reasoning_content || "",
-        content: message.content || "",
-        finishReason: choice ? choice.finish_reason : null,
-        usage: currentResponse.usage
-      };
-      const bridged = buildChatCompletionFromBridge(aggregate, parseOptions);
-      responseLog.responseChanges = ["bridge response synthesized from custom text protocol"];
-      responseLog.responseBodyRewritten = bridged;
-      finalText = JSON.stringify(bridged);
-    } else {
-      responseLog.responseChanges = [];
-      responseLog.responseBodyRewritten = responseParsed.value;
-    }
-  } else {
-    responseLog.responseBodyOriginalText = responseText;
-  }
-
-  writeJsonLog(path.join(LOG_DIR, `${requestId}-response.json`), responseLog);
-  appendActivity(`request.done id=${requestId} status=${upstreamResponse.status}`);
-
-  copyResponseHeaders(upstreamResponse.headers, res, Buffer.byteLength(finalText));
-  res.writeHead(upstreamResponse.status);
-  res.end(finalText);
-}
-
-async function requestHandler(req, res) {
-  try {
-    if (req.method === "GET" && req.url === "/health") {
-      const payload = JSON.stringify({
-        ok: true,
-        upstream: UPSTREAM_BASE_URL,
-        debugLogs: ENABLE_DEBUG_LOGS,
-        ...(ENABLE_DEBUG_LOGS ? { logDir: LOG_DIR } : {}),
-        toolBridgeMode: "text"
-      });
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "content-length": Buffer.byteLength(payload)
-      });
-      res.end(payload);
-      return;
-    }
-
-    await proxyRequest(req, res);
-  } catch (error) {
-    appendActivity(
-      `request.error method=${req.method} path=${req.url} message=${error instanceof Error ? error.stack || error.message : String(error)}`
-    );
-    if (res.headersSent) {
-      res.end();
-      return;
-    }
-    const payload = JSON.stringify({
-      error: {
-        message: error instanceof Error ? error.message : String(error),
-        type: "proxy_error"
+      const aggregate = buildAggregateFromChatCompletion(upstreamJson.value);
+      const bridgeResult = buildBridgeResultFromText(aggregate.content, aggregate.reasoning, bridgeMeta.normalizedTools);
+      if (bridgeResult.kind === "invalid" && attempt === 0) {
+        logSection("RAW MODEL OUTPUT", aggregate.content);
+        logSection("INVALID BRIDGE COMPLETION", { retrying: true, upstream_finish_reason: aggregate.finishReason });
+        activeResponse = await fetchUpstream(req, upstreamUrl, retryBuffer);
+        continue;
       }
-    });
-    res.writeHead(502, {
-      "content-type": "application/json",
-      "content-length": Buffer.byteLength(payload)
-    });
-    res.end(payload);
+      if (bridgeResult.kind === "invalid") {
+        const errorPayload = { error: { code: bridgeResult.error.code, message: bridgeResult.error.message, upstream_finish_reason: aggregate.finishReason } };
+        logSection("RAW MODEL OUTPUT", aggregate.content);
+        logSection("INVALID BRIDGE COMPLETION", errorPayload);
+        const buf = Buffer.from(JSON.stringify(errorPayload), "utf8");
+        res.writeHead(502, { "content-type": "application/json; charset=utf-8", "content-length": String(buf.length) });
+        res.end(buf);
+        return;
+      }
+
+      const translated = buildChatCompletionFromBridge(aggregate, bridgeMeta.normalizedTools);
+      logSection("RAW MODEL OUTPUT", aggregate.content);
+      logSection("TRANSLATED RESPONSE", translated);
+      const buf = Buffer.from(JSON.stringify(translated), "utf8");
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "content-length": String(buf.length) });
+      res.end(buf);
+      return;
+    }
   }
+
+  if (contentType.includes("text/event-stream")) {
+    res.writeHead(upstreamResponse.status, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive"
+    });
+    for await (const chunk of upstreamResponse.body) res.write(chunk);
+    res.end();
+    log(`--- PASSTHROUGH SSE (status ${upstreamResponse.status}) ---\n`);
+    return;
+  }
+
+  const rawBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
+  copyResponseHeaders(upstreamResponse.headers, res, rawBuffer.length);
+  res.writeHead(upstreamResponse.status);
+  res.end(rawBuffer);
+  log(`--- PASSTHROUGH (status ${upstreamResponse.status}) ---\n`);
 }
 
 function startServer() {
-  const server = http.createServer(requestHandler);
+  const server = http.createServer((req, res) => {
+    proxyRequest(req, res).catch((error) => {
+      log(`--- ERROR ---\n${error && error.stack ? error.stack : error}\n`);
+      console.error("[NanoProxy Error]", error);
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: { message: String(error && error.message ? error.message : error) } }));
+      } else {
+        res.end();
+      }
+    });
+  });
+
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-    appendActivity(`server.listen host=${LISTEN_HOST} port=${LISTEN_PORT} upstream=${UPSTREAM_BASE_URL} bridge=text`);
-    process.stdout.write(`tool-proxy listening on http://${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM_BASE_URL} (bridge=text)\n`);
+    console.log(`NanoProxy listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
+    if (ENABLE_DEBUG_LOGS && SESSION_LOG) console.log(`Session log: ${SESSION_LOG}`);
   });
   return server;
 }
-
-process.on("uncaughtException", (error) => {
-  appendActivity(`fatal.uncaughtException message=${error.stack || error.message}`);
-});
-
-process.on("unhandledRejection", (reason) => {
-  appendActivity(`fatal.unhandledRejection message=${reason instanceof Error ? reason.stack || reason.message : String(reason)}`);
-});
 
 if (require.main === module) {
   startServer();
 }
 
-// Export core functions and server for external use
 module.exports = {
-  // Server
   startServer,
-  
-  // Re-export core functions for plugin use
   ...core
 };
-
-
 
