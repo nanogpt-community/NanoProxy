@@ -1,12 +1,16 @@
 {
-  "name": "nanoproxy",
+  "name": "nanogpt-nanoproxy",
   "private": false,
-  "version": "2.0.0",
-  "description": "Local OpenAI-compatible NanoGPT bridge with XML tool calling, OpenCode plugin support, native-first fallback, and standalone server mode.",
+  "version": "2.0.1",
+  "description": "Local OpenAI-compatible NanoGPT bridge with OpenCode npm plugin support, object/XML bridge protocols, native-first fallback, and standalone server mode.",
   "type": "commonjs",
-  "main": "./src/plugin.mjs",
+  "main": "./index.mjs",
   "exports": {
-    ".": "./src/plugin.mjs",
+    ".": {
+      "import": "./index.mjs",
+      "default": "./index.mjs"
+    },
+    "./plugin": "./src/plugin.mjs",
     "./server": "./server.js",
     "./core": "./src/core.js"
   },
@@ -22,11 +26,27 @@
     "xml",
     "proxy",
     "llm",
-    "ai"
+    "ai",
+    "plugin",
+    "opencode-plugin",
+    "npm"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/nanogpt-community/NanoProxy"
+  },
+  "files": [
+    "index.mjs",
+    "src",
+    "server.js",
+    "README.md",
+    "LICENSE",
+    "toggle-debug.ps1",
+    "Dockerfile",
+    "docker-compose.yml"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

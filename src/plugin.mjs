@@ -5,8 +5,7 @@ import { tmpdir } from "node:os"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
-const REPO_ROOT = dirname(__dirname)
-const DEBUG_FLAG_FILE = join(REPO_ROOT, ".debug-logging")
+const DEBUG_FLAG_FILE = join(process.cwd(), ".debug-logging")
 const FETCH_PATCH_KEY = Symbol.for("nanoproxy.fetchPatch")
 
 export const NanoProxyPlugin = async function NanoProxyPlugin() {

@@ -134,7 +134,17 @@ Matching is substring-based against the model id.
 
 ## OpenCode Plugin Setup
 
-Configure OpenCode to load the plugin:
+NanoProxy is set up to be publishable as an npm OpenCode plugin. Once the package is published, you will be able to install it by package name in your OpenCode config:
+
+```json
+{
+  "plugin": [
+    "nanogpt-nanoproxy"
+  ]
+}
+```
+
+For local development or before the npm package is published, you can still load it from a local file path:
 
 ```json
 {
@@ -182,7 +192,7 @@ Default plugin log locations:
 - session logs: system temp under `nanoproxy-plugin-logs`
 - raw artifacts: system temp under `nanoproxy-plugin-logs/raw` when raw logging is enabled
 
-The `.debug-logging` file also enables debug logging.
+If you installed the OpenCode plugin from npm, create a `.debug-logging` file in the OpenCode workspace root to enable plugin debug logging. Plugin logs still go to the temp folder under `nanoproxy-plugin-logs`.
 
 ## Standalone Server Setup
 
