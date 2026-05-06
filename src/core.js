@@ -370,6 +370,20 @@ function requestNeedsBridge(body) {
   return !!(requestNeedsXmlBridge(body) && modelNeedsBridge(body && body.model));
 }
 
+function shouldIncludeUsage() {
+  const raw = process.env.NANOPROXY_INCLUDE_USAGE;
+  if (raw == null || raw === "") return true;
+  return !["0", "false", "off", "no"].includes(String(raw).trim().toLowerCase());
+}
+
+function withOptionalIncludeUsage(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const rewritten = clone(body);
+  if (shouldIncludeUsage()) rewritten.include_usage = true;
+  else delete rewritten.include_usage;
+  return rewritten;
+}
+
 // ---------------------------------------------------------------------------
 // Transform the request: strip tools, inject system prompt, rewrite history
 // ---------------------------------------------------------------------------
@@ -377,7 +391,7 @@ function requestNeedsBridge(body) {
 function transformRequestForXmlBridge(body) {
   if (getBridgeProtocol() === "object") return transformRequestForObjectBridge(body, normalizeTools(body && body.tools));
 
-  const rewritten = clone(body);
+  const rewritten = withOptionalIncludeUsage(body);
   const normalizedTools = normalizeTools(rewritten.tools);
   const toolNames = normalizedTools.map((t) => t.name);
   const parallelAllowed = body.parallel_tool_calls !== false;
@@ -973,6 +987,8 @@ module.exports = {
   xmlUnescape,
   normalizeTools,
   getBridgeProtocol,
+  shouldIncludeUsage,
+  withOptionalIncludeUsage,
   buildXmlBridgeSystemMessage,
   buildObjectBridgeSystemMessage,
   encodeAssistantToolCallsMessage,

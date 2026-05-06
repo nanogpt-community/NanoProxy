@@ -40,6 +40,26 @@ const core = require("./src/core.js");
   console.log("  PASS: transformRequestForXmlBridge");
 })();
 
+// ---- Test: include_usage is enabled by default and can be disabled via env flag ----
+(function testOptionalIncludeUsage() {
+  const prev = process.env.NANOPROXY_INCLUDE_USAGE;
+  try {
+    delete process.env.NANOPROXY_INCLUDE_USAGE;
+    const body = { model: 'test-model', messages: [{ role: 'user', content: 'Hello' }] };
+    const rewritten = core.withOptionalIncludeUsage(body);
+    assert.equal(rewritten.include_usage, true);
+    assert.equal(body.include_usage, undefined);
+
+    process.env.NANOPROXY_INCLUDE_USAGE = '0';
+    const disabled = core.withOptionalIncludeUsage(body);
+    assert.equal(disabled.include_usage, undefined);
+  } finally {
+    if (prev === undefined) delete process.env.NANOPROXY_INCLUDE_USAGE;
+    else process.env.NANOPROXY_INCLUDE_USAGE = prev;
+  }
+  console.log("  PASS: optional include_usage flag");
+})();
+
 // ---- Test: parallel requests get a batched example in the prompt ----
 (function testParallelPromptExample() {
   const body = {

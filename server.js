@@ -11,6 +11,7 @@ const {
   requestNeedsBridge,
   requestNeedsXmlBridge,
   transformRequestForBridge,
+  withOptionalIncludeUsage,
   buildAggregateFromChatCompletion,
   buildChatCompletionFromBridge,
   acceptNativeJson,
@@ -124,12 +125,13 @@ async function proxyRequest(req, res) {
   const reqText = reqBuffer.toString("utf8");
   const parsed = tryParseJson(reqText);
   const isJson = (req.headers["content-type"] || "").includes("application/json") && parsed.ok;
+  const requestBody = isJson ? withOptionalIncludeUsage(parsed.value) : null;
 
   let upstreamBuffer = reqBuffer;
   let bridgeMeta = null;
   let attemptNativeFirst = false;
 
-  if (isJson && requestNeedsXmlBridge(parsed.value) && !requestNeedsBridge(parsed.value)) {
+  if (isJson && requestNeedsXmlBridge(requestBody) && !requestNeedsBridge(requestBody)) {
     attemptNativeFirst = true;
   }
 
@@ -138,12 +140,13 @@ async function proxyRequest(req, res) {
   log(`${"=".repeat(80)}`);
   if (ENABLE_DEBUG_LOGS) logSection("REQUEST HEADERS", redactHeaders(req.headers));
 
-  if (isJson && requestNeedsXmlBridge(parsed.value) && !attemptNativeFirst) {
-    bridgeMeta = transformRequestForBridge(parsed.value);
+  if (isJson && requestNeedsXmlBridge(requestBody) && !attemptNativeFirst) {
+    bridgeMeta = transformRequestForBridge(requestBody);
     upstreamBuffer = Buffer.from(JSON.stringify(bridgeMeta.rewritten), "utf8");
     log(`--- BRIDGE ACTIVE | Tools: [${bridgeMeta.toolNames.join(", ")}] ---\n`);
   } else if (attemptNativeFirst) {
-    log(`--- NATIVE-FIRST ACTIVE | Model: ${parsed.value && parsed.value.model ? parsed.value.model : "(unknown)"} ---\n`);
+    upstreamBuffer = Buffer.from(JSON.stringify(requestBody), "utf8");
+    log(`--- NATIVE-FIRST ACTIVE | Model: ${requestBody && requestBody.model ? requestBody.model : "(unknown)"} ---\n`);
   }
 
   let upstreamResponse = await fetchUpstream(req, upstreamUrl, upstreamBuffer);
@@ -184,7 +187,7 @@ async function proxyRequest(req, res) {
       return;
     }
 
-    bridgeMeta = transformRequestForBridge(parsed.value);
+    bridgeMeta = transformRequestForBridge(requestBody);
     upstreamBuffer = Buffer.from(JSON.stringify(bridgeMeta.rewritten), "utf8");
     log(`--- BRIDGE ACTIVE | Tools: [${bridgeMeta.toolNames.join(", ")}] ---\n`);
     upstreamResponse = await fetchUpstream(req, upstreamUrl, upstreamBuffer);

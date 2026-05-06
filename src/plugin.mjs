@@ -27,6 +27,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
     tryParseJson,
     requestNeedsBridge,
     requestNeedsXmlBridge,
+    withOptionalIncludeUsage,
     transformRequestForBridge,
     buildAggregateFromChatCompletion,
     buildChatCompletionFromBridge,
@@ -448,13 +449,29 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
     }
 
     const parsed = tryParseJson(bodyText)
-    if (!parsed.ok || !requestNeedsXmlBridge(parsed.value)) return originalFetch(input, init, ...rest)
+    if (!parsed.ok) return originalFetch(input, init, ...rest)
+    const requestBody = withOptionalIncludeUsage(parsed.value)
+    if (!requestNeedsXmlBridge(requestBody)) return originalFetch(input, init, ...rest)
 
-    const shouldBridgeImmediately = requestNeedsBridge(parsed.value)
+    const shouldBridgeImmediately = requestNeedsBridge(requestBody)
     if (!shouldBridgeImmediately) {
-      log(`--- NATIVE-FIRST ATTEMPT | request=${requestId} | model=${parsed.value.model || "(unknown)"} ---`)
+      log(`--- NATIVE-FIRST ATTEMPT | request=${requestId} | model=${requestBody.model || "(unknown)"} ---`)
       log("")
-      const nativeResponse = await originalFetch(input, init, ...rest)
+      const nativeBodyText = JSON.stringify(requestBody)
+      const nativeBodyBytes = new TextEncoder().encode(nativeBodyText)
+      const nativeHeaders = new Headers(input instanceof Request ? input.headers : {})
+      if (init?.headers) {
+        const initHeaders = new Headers(init.headers)
+        for (const [k, v] of initHeaders) nativeHeaders.set(k, v)
+      }
+      nativeHeaders.set("content-type", "application/json")
+      nativeHeaders.set("content-length", String(nativeBodyBytes.length))
+      const nativeResponse = await originalFetch(urlStr, {
+        ...init,
+        method: "POST",
+        headers: nativeHeaders,
+        body: nativeBodyBytes,
+      })
       const nativeContentType = nativeResponse.headers.get("content-type") ?? ""
       if (nativeContentType.includes("text/event-stream")) {
         const streamText = await nativeResponse.text()
@@ -490,13 +507,13 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
       log("")
     }
 
-    const transformed = transformRequestForBridge(parsed.value)
+    const transformed = transformRequestForBridge(requestBody)
     log(`--- BRIDGE ACTIVE | protocol=${transformed.protocol} | tools=[${transformed.toolNames.join(", ")}] ---`)
     log("")
     writeRawDebugJson(`${requestId}-request.json`, {
       requestId,
       url: urlStr,
-      requestBodyOriginal: parsed.value,
+      requestBodyOriginal: requestBody,
       requestBodyRewritten: transformed.rewritten,
       bridgeApplied: transformed.bridgeApplied
     })

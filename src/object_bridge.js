@@ -166,6 +166,13 @@ function translateMessagesForObjectBridge(messages) {
 
 function transformRequestForObjectBridge(body, normalizedTools) {
   const rewritten = JSON.parse(JSON.stringify(body));
+  const includeUsageRaw = process.env.NANOPROXY_INCLUDE_USAGE;
+  const includeUsage =
+    includeUsageRaw == null || includeUsageRaw === ""
+      ? true
+      : !["0", "false", "off", "no"].includes(String(includeUsageRaw).trim().toLowerCase());
+  if (includeUsage) rewritten.include_usage = true;
+  else delete rewritten.include_usage;
   const toolNames = normalizedTools.map((t) => t.name);
   const parallelAllowed = body.parallel_tool_calls !== false;
   const inheritedSystemText = collectObjectBridgeSystemText(rewritten.messages || []);
