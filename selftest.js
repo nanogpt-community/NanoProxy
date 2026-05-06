@@ -50,9 +50,19 @@ const core = require("./src/core.js");
     assert.equal(rewritten.include_usage, true);
     assert.equal(body.include_usage, undefined);
 
+    const streamingBody = { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'Hello' }] };
+    const streamingRewritten = core.withOptionalIncludeUsage(streamingBody);
+    assert.equal(streamingRewritten.include_usage, true);
+    assert.equal(streamingRewritten.stream_options.include_usage, true);
+
     process.env.NANOPROXY_INCLUDE_USAGE = '0';
     const disabled = core.withOptionalIncludeUsage(body);
     assert.equal(disabled.include_usage, undefined);
+
+    const disabledStreaming = core.withOptionalIncludeUsage({ model: 'test-model', stream: true, stream_options: { other: true }, messages: [] });
+    assert.equal(disabledStreaming.include_usage, undefined);
+    assert.equal(disabledStreaming.stream_options.other, true);
+    assert.equal(disabledStreaming.stream_options.include_usage, undefined);
   } finally {
     if (prev === undefined) delete process.env.NANOPROXY_INCLUDE_USAGE;
     else process.env.NANOPROXY_INCLUDE_USAGE = prev;

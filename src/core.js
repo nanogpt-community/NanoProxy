@@ -379,8 +379,24 @@ function shouldIncludeUsage() {
 function withOptionalIncludeUsage(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const rewritten = clone(body);
-  if (shouldIncludeUsage()) rewritten.include_usage = true;
-  else delete rewritten.include_usage;
+  if (shouldIncludeUsage()) {
+    rewritten.include_usage = true;
+    if (rewritten.stream === true) {
+      const streamOptions = rewritten.stream_options && typeof rewritten.stream_options === "object" && !Array.isArray(rewritten.stream_options)
+        ? clone(rewritten.stream_options)
+        : {};
+      streamOptions.include_usage = true;
+      rewritten.stream_options = streamOptions;
+    }
+  } else {
+    delete rewritten.include_usage;
+    if (rewritten.stream_options && typeof rewritten.stream_options === "object" && !Array.isArray(rewritten.stream_options)) {
+      const streamOptions = clone(rewritten.stream_options);
+      delete streamOptions.include_usage;
+      if (Object.keys(streamOptions).length === 0) delete rewritten.stream_options;
+      else rewritten.stream_options = streamOptions;
+    }
+  }
   return rewritten;
 }
 
