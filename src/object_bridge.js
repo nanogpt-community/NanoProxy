@@ -57,6 +57,7 @@ function buildObjectBridgeSystemMessage(normalizedTools, parallelAllowed = true,
   const manifest = JSON.stringify(buildObjectToolManifest(normalizedTools), null, 2);
   const exampleTool = normalizedTools[0];
   const completionToolRequired = toolExists(normalizedTools, "attempt_completion");
+  const followupToolRequired = toolExists(normalizedTools, "ask_followup_question");
   const exampleArgs = {};
   if (exampleTool && Array.isArray(exampleTool.args)) {
     for (const arg of exampleTool.args) exampleArgs[arg.name] = arg.type === "string" ? "example" : {};
@@ -88,6 +89,9 @@ function buildObjectBridgeSystemMessage(normalizedTools, parallelAllowed = true,
     completionToolRequired
       ? '- IMPORTANT: The tool "attempt_completion" is available in this session. When you have finished successfully, do NOT use mode "final". Use mode "tool" and call "attempt_completion" for the completion turn.'
       : '- Use mode "final" for a plain successful completion when no more tools are needed.',
+    followupToolRequired
+      ? '- IMPORTANT: The tool "ask_followup_question" is available in this session. When you need clarification, want to ask the user a question, or are replying to a purely conversational prompt, do NOT use mode "clarify". Use mode "tool" and call "ask_followup_question" instead.'
+      : '- Use mode "clarify" when you need the user to answer a question before continuing.',
     '- Prefer each tool call object to use "name" and an "arguments" object. Flattened argument fields are also accepted when needed.',
     parallelAllowed
       ? '- You may batch multiple tool calls only when they are clearly independent. Keep batches sensible; do not try to complete an entire task in one oversized turn.'
@@ -103,7 +107,9 @@ function buildObjectBridgeSystemMessage(normalizedTools, parallelAllowed = true,
     completionToolRequired
       ? JSON.stringify({ v: 1, mode: "tool", message: "The task is complete. I will submit the final result now.", tool_calls: [{ name: "attempt_completion", arguments: { result: "Done. The task is complete." } }] }, null, 2)
       : JSON.stringify({ v: 1, mode: "final", message: "Done. The task is complete." }, null, 2),
-    JSON.stringify({ v: 1, mode: "clarify", message: "Which file do you want me to update?" }, null, 2),
+    followupToolRequired
+      ? JSON.stringify({ v: 1, mode: "tool", message: "I need a bit more direction before continuing.", tool_calls: [{ name: "ask_followup_question", arguments: { question: "Which file do you want me to update?" } }] }, null, 2)
+      : JSON.stringify({ v: 1, mode: "clarify", message: "Which file do you want me to update?" }, null, 2),
     "",
     "Tool manifest:",
     manifest,

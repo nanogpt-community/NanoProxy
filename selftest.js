@@ -713,24 +713,32 @@ function withBridgeProtocol(protocol, fn) {
   console.log('  PASS: object bridge assistant history encoding');
 })();
 
-// ---- Test: object bridge only requires attempt_completion when that tool exists ----
-(function testObjectBridgeAttemptCompletionPromptHint() {
+// ---- Test: object bridge only adds completion/follow-up tool rules when those tools exist ----
+(function testObjectBridgeToolSpecificPromptHints() {
   withBridgeProtocol('object', () => {
-    const withAttempt = core.transformRequestForBridge({
+    const withBoth = core.transformRequestForBridge({
       model: 'test-model',
       messages: [{ role: 'user', content: 'Finish the task.' }],
-      tools: [{ type: 'function', function: { name: 'attempt_completion', parameters: { type: 'object', properties: { result: { type: 'string' } } } } }]
+      tools: [
+        { type: 'function', function: { name: 'attempt_completion', parameters: { type: 'object', properties: { result: { type: 'string' } } } } },
+        { type: 'function', function: { name: 'ask_followup_question', parameters: { type: 'object', properties: { question: { type: 'string' } } } } }
+      ]
     });
-    const withoutAttempt = core.transformRequestForBridge({
+    const withoutSpecial = core.transformRequestForBridge({
       model: 'test-model',
       messages: [{ role: 'user', content: 'Finish the task.' }],
       tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }]
     });
-    assert.match(withAttempt.rewritten.messages[0].content, /attempt_completion/);
-    assert.match(withAttempt.rewritten.messages[0].content, /do NOT use mode "final"/i);
-    assert.doesNotMatch(withoutAttempt.rewritten.messages[0].content, /attempt_completion/);
+    const promptWithBoth = withBoth.rewritten.messages[0].content;
+    const promptWithoutSpecial = withoutSpecial.rewritten.messages[0].content;
+    assert.match(promptWithBoth, /attempt_completion/);
+    assert.match(promptWithBoth, /do NOT use mode "final"/i);
+    assert.match(promptWithBoth, /ask_followup_question/);
+    assert.match(promptWithBoth, /do NOT use mode "clarify"/i);
+    assert.doesNotMatch(promptWithoutSpecial, /attempt_completion/);
+    assert.doesNotMatch(promptWithoutSpecial, /ask_followup_question/);
   });
-  console.log('  PASS: object bridge attempt_completion prompt hint');
+  console.log('  PASS: object bridge tool-specific prompt hints');
 })();
 
 // ---- Test: object bridge accepts fenced JSON output ----
