@@ -127,7 +127,9 @@ async function proxyRequest(req, res) {
   const isJson = (req.headers["content-type"] || "").includes("application/json") && parsed.ok;
   const requestBody = isJson ? withOptionalIncludeUsage(parsed.value) : null;
 
-  let upstreamBuffer = reqBuffer;
+  let upstreamBuffer = isJson
+    ? Buffer.from(JSON.stringify(requestBody), "utf8")
+    : reqBuffer;
   let bridgeMeta = null;
   let attemptNativeFirst = false;
 
@@ -283,6 +285,7 @@ async function proxyRequest(req, res) {
     let finalToolIndex = 0;
     let finalFinishReason = null;
     let invalidNotice = null;
+    let upstreamUsage = null;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       if (!(activeResponse.ok && activeContentType.includes("text/event-stream"))) break;
@@ -333,6 +336,7 @@ async function proxyRequest(req, res) {
           const payload = parsedPayload.value;
           if (payload.model) model = payload.model;
           if (payload.created) created = payload.created;
+          if (payload.usage) upstreamUsage = payload.usage;
           const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
           if (!choice) continue;
           if (choice.finish_reason != null) upstreamFinishReason = choice.finish_reason;
@@ -450,7 +454,8 @@ async function proxyRequest(req, res) {
 
     writeSse({
       id, object: "chat.completion.chunk", created, model,
-      choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason || "stop" }]
+      choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason || "stop" }],
+      ...(upstreamUsage ? { usage: upstreamUsage } : {})
     });
     res.write("data: [DONE]\n\n");
     clearInterval(heartbeatTimer);

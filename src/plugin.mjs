@@ -199,6 +199,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
       let finalFinishReason = "stop"
       let finalToolIndex = 0
       let invalidNotice = null
+      let upstreamUsage = null
 
       try {
         await writeChunk(sseLine({
@@ -261,6 +262,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
               const parsed = tryParseJson(payloadStr)
               if (!parsed.ok) continue
               const payload = parsed.value
+              if (payload.usage) upstreamUsage = payload.usage
               const choice = Array.isArray(payload.choices) ? payload.choices[0] : null
               if (!choice) continue
               if (choice.finish_reason != null) upstreamFinishReason = choice.finish_reason
@@ -389,7 +391,8 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: "nanoproxy",
-          choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason }]
+          choices: [{ index: 0, delta: {}, finish_reason: finalFinishReason }],
+          ...(upstreamUsage ? { usage: upstreamUsage } : {})
         }))
         await writeChunk("data: [DONE]\n\n")
         streamClosed = true
@@ -451,7 +454,23 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
     const parsed = tryParseJson(bodyText)
     if (!parsed.ok) return originalFetch(input, init, ...rest)
     const requestBody = withOptionalIncludeUsage(parsed.value)
-    if (!requestNeedsXmlBridge(requestBody)) return originalFetch(input, init, ...rest)
+    if (!requestNeedsXmlBridge(requestBody)) {
+      const passthroughBodyText = JSON.stringify(requestBody)
+      const passthroughBodyBytes = new TextEncoder().encode(passthroughBodyText)
+      const passthroughHeaders = new Headers(input instanceof Request ? input.headers : {})
+      if (init?.headers) {
+        const initHeaders = new Headers(init.headers)
+        for (const [k, v] of initHeaders) passthroughHeaders.set(k, v)
+      }
+      passthroughHeaders.set("content-type", "application/json")
+      passthroughHeaders.set("content-length", String(passthroughBodyBytes.length))
+      return originalFetch(urlStr, {
+        ...init,
+        method: "POST",
+        headers: passthroughHeaders,
+        body: passthroughBodyBytes,
+      })
+    }
 
     const shouldBridgeImmediately = requestNeedsBridge(requestBody)
     if (!shouldBridgeImmediately) {
