@@ -8,20 +8,40 @@ const __dirname = dirname(__filename)
 const DEBUG_FLAG_FILE = join(process.cwd(), ".debug-logging")
 const FETCH_PATCH_KEY = Symbol.for("nanoproxy.fetchPatch")
 
-export const NanoProxyPlugin = async function NanoProxyPlugin() {
-  if (globalThis[FETCH_PATCH_KEY]?.installed) return {}
+function createPluginHooks(client) {
+  let announced = false
+  return {
+    event: async () => {
+      if (announced) return
+      announced = true
+      try {
+        await client?.app?.log?.({
+          body: {
+            service: "nanogpt-nanoproxy",
+            level: "info",
+            message: "NanoProxy plugin initialized"
+          }
+        })
+      } catch {}
+    }
+  }
+}
+
+export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
+  const hooks = createPluginHooks(ctx?.client)
+  if (globalThis[FETCH_PATCH_KEY]?.installed) return hooks
   let imported
   try {
     imported = await import(pathToFileURL(join(__dirname, "core.js")).href)
   } catch {
-    return {}
+    return hooks
   }
 
   const core = imported?.default && typeof imported.default === "object"
     ? { ...imported.default, ...imported }
     : imported
 
-  if (!core || typeof core !== "object") return {}
+  if (!core || typeof core !== "object") return hooks
 
   const {
     tryParseJson,
@@ -38,7 +58,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
     createStreamingBridgeParser
   } = core
 
-  if (typeof tryParseJson !== "function" || typeof transformRequestForBridge !== "function") return {}
+  if (typeof tryParseJson !== "function" || typeof transformRequestForBridge !== "function") return hooks
 
   const LOG_DIR = process.env.NANOPROXY_LOG_DIR || join(tmpdir(), "nanoproxy-plugin-logs")
   const VERBOSE =
@@ -635,7 +655,7 @@ export const NanoProxyPlugin = async function NanoProxyPlugin() {
     return new Response(responseText, { status: response.status, headers: response.headers })
   }
 
-  return {}
+  return hooks
 }
 
 export default NanoProxyPlugin

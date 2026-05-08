@@ -1,7 +1,7 @@
 {
   "name": "nanogpt-nanoproxy",
   "private": false,
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Local OpenAI-compatible NanoGPT bridge with OpenCode npm plugin support, object/XML bridge protocols, native-first fallback, and standalone server mode.",
   "type": "commonjs",
   "main": "./index.mjs",
