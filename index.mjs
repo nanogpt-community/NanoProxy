@@ -1,2 +1,6 @@
-export { NanoProxyPlugin } from "./src/plugin.mjs"
-export { default } from "./src/plugin.mjs"
+import NanoProxyPlugin from "./src/plugin.mjs"
+
+export default {
+  id: "nanogpt-nanoproxy",
+  server: NanoProxyPlugin
+}
