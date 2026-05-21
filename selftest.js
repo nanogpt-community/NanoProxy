@@ -615,6 +615,31 @@ function withBridgeProtocol(protocol, fn) {
   });
   console.log('  PASS: buildBridgeResultFromPlainProseIsInvalidInObjectMode');
 })();
+// ---- Test: object bridge recovers structured turns from reasoning ----
+(function testObjectBridgeRecoversFromReasoning() {
+  withBridgeProtocol('object', () => {
+    const toolResult = core.buildBridgeResultFromText('', JSON.stringify({
+      v: 1,
+      mode: 'tool',
+      message: 'I will inspect the repo now.',
+      tool_calls: [{ name: 'bash', arguments: { command: 'ls' } }]
+    }), [{ name: 'bash' }]);
+    assert.equal(toolResult.kind, 'tool_calls');
+    assert.equal(toolResult.message.content, 'I will inspect the repo now.');
+    assert.equal(toolResult.message.reasoning_content, '');
+    assert.equal(toolResult.message.tool_calls[0].function.name, 'bash');
+
+    const finalResult = core.buildBridgeResultFromText('', JSON.stringify({
+      v: 1,
+      mode: 'final',
+      message: 'Done.'
+    }), [{ name: 'bash' }]);
+    assert.equal(finalResult.kind, 'final');
+    assert.equal(finalResult.message.content, 'Done.');
+    assert.equal(finalResult.message.reasoning_content, '');
+  });
+  console.log('  PASS: object bridge recovers structured turns from reasoning');
+})();
 // ---- Test: object bridge accepts flattened tool-call arguments ----
 (function testBuildBridgeResultFromFlattenedObjectText() {
   withBridgeProtocol('object', () => {

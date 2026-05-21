@@ -100,9 +100,34 @@ async function fetchUpstream(req, upstreamUrl, bodyBuffer) {
 function buildInvalidBridgeRetryBuffer(rewrittenBody, protocol = "xml") {
   const retryBody = JSON.parse(JSON.stringify(rewrittenBody));
   retryBody.messages = Array.isArray(retryBody.messages) ? retryBody.messages.slice() : [];
+  const systemText = retryBody.messages
+    .filter((message) => message && message.role === "system")
+    .map((message) => typeof message.content === "string" ? message.content : "")
+    .join("\n");
+  const manifestMatch = systemText.match(/Tool manifest:\n([\s\S]*?)(?:\n\nAdditional system instructions|\n*$)/);
+  const manifestParsed = manifestMatch ? tryParseJson(manifestMatch[1].trim()) : { ok: false };
+  const toolNames = manifestParsed.ok && Array.isArray(manifestParsed.value)
+    ? manifestParsed.value.map((tool) => tool && tool.name).filter(Boolean)
+    : [];
+  const hasAttemptCompletion = toolNames.includes("attempt_completion");
+  const hasFollowup = toolNames.includes("ask_followup_question");
   const content = protocol === "object"
-    ? "Your previous response was invalid because it contained no visible content or tool call. Return exactly one valid JSON turn object that matches the required bridge contract. Do not return an empty response."
-    : "Your previous response was invalid because it contained no visible content and no XML tool call. Do not return an empty response. If you need to act, emit the XML tool call now. If no tool is needed, provide a normal visible reply.";
+    ? [
+        "Your previous response ended with no visible content and no tool call. That is invalid for this tool-enabled turn.",
+        "You must now return exactly one JSON object that follows the Structured Turn Contract. No markdown. No prose outside the JSON object. Do not return an empty response.",
+        toolNames.length ? `Available tools: ${toolNames.join(", ")}.` : "",
+        hasAttemptCompletion ? 'If the task is complete, use mode "tool" and call "attempt_completion". Do not use mode "final" for completion.' : 'If no tool is needed, use mode "final" with a non-empty message.',
+        hasFollowup ? 'If you need input from the user or are answering a conversational prompt, use mode "tool" and call "ask_followup_question". Do not use mode "clarify".' : 'If you need input from the user, use mode "clarify" with a non-empty question.',
+        'If work remains, use mode "tool" with one of the available tools.'
+      ].filter(Boolean).join("\n")
+    : [
+        "Your previous response ended with no visible content and no XML tool call. That is invalid for this tool-enabled turn.",
+        "Do not return an empty response.",
+        toolNames.length ? `Available tools: ${toolNames.join(", ")}.` : "",
+        hasAttemptCompletion ? 'If the task is complete, emit the "attempt_completion" tool call.' : "If no tool is needed, provide a normal visible reply.",
+        hasFollowup ? 'If you need input from the user or are answering a conversational prompt, emit the "ask_followup_question" tool call.' : "",
+        "If work remains, emit the XML tool call now."
+      ].filter(Boolean).join("\n");
   retryBody.messages.push({ role: "system", content });
   return Buffer.from(JSON.stringify(retryBody), "utf8");
 }

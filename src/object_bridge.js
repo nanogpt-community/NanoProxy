@@ -739,6 +739,30 @@ function parseObjectBridgeAssistantText(text, tools) {
 function buildBridgeResultFromObjectText(text, reasoning, tools) {
   const parsed = parseObjectBridgeAssistantText(text, tools);
   if (parsed.kind === "invalid") {
+    const recoveredFromReasoning = parseObjectBridgeAssistantText(reasoning, tools);
+    if (recoveredFromReasoning.kind === "tool_calls") {
+      return {
+        kind: "tool_calls",
+        message: {
+          role: "assistant",
+          content: recoveredFromReasoning.content || "",
+          reasoning_content: "",
+          tool_calls: recoveredFromReasoning.toolCalls
+        },
+        finishReason: "tool_calls"
+      };
+    }
+    if (recoveredFromReasoning.kind === "final") {
+      return {
+        kind: "final",
+        message: {
+          role: "assistant",
+          content: recoveredFromReasoning.content || "",
+          reasoning_content: ""
+        },
+        finishReason: "stop"
+      };
+    }
     return {
       kind: "invalid",
       message: {
