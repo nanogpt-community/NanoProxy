@@ -34,7 +34,7 @@ function buildObjectToolManifest(normalizedTools) {
   return normalizedTools.map((tool) => {
     const argumentsSchema = {};
     for (const arg of tool.args || []) {
-      const schema = arg && arg.schema && typeof arg.schema === "object" ? JSON.parse(JSON.stringify(arg.schema)) : {};
+      const schema = arg && arg.schema && typeof arg.schema === "object" ? structuredClone(arg.schema) : {};
       if (!schema.type && arg.type) schema.type = arg.type;
       if (arg.description && !schema.description) schema.description = arg.description;
       argumentsSchema[arg.name] = schema;
@@ -171,7 +171,7 @@ function translateMessagesForObjectBridge(messages) {
 }
 
 function transformRequestForObjectBridge(body, normalizedTools) {
-  const rewritten = JSON.parse(JSON.stringify(body));
+  const rewritten = structuredClone(body);
   const includeUsageRaw = process.env.NANOPROXY_INCLUDE_USAGE;
   const includeUsage =
     includeUsageRaw == null || includeUsageRaw === ""
@@ -473,8 +473,14 @@ function buildNativeToolCall(item) {
   };
 }
 
+const _canonicalizeCache = new Map();
 function canonicalizeToolName(name) {
-  return String(name || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  const key = String(name || "");
+  const cached = _canonicalizeCache.get(key);
+  if (cached !== undefined) return cached;
+  const result = key.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  _canonicalizeCache.set(key, result);
+  return result;
 }
 
 function buildKnownToolNameMaps(tools) {
@@ -506,7 +512,7 @@ function normalizeToolArguments(value) {
   if (value == null) return {};
   const parsed = parseLooseJsonValue(value);
   if (parsed !== null) return normalizeToolArguments(parsed);
-  if (value && typeof value === "object" && !Array.isArray(value)) return JSON.parse(JSON.stringify(value));
+  if (value && typeof value === "object" && !Array.isArray(value)) return structuredClone(value);
   if (Array.isArray(value)) return { items: value };
   if (typeof value === "string") return value.trim() ? { input: value } : {};
   return { value };

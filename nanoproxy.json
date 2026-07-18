@@ -1,0 +1,12 @@
+{
+  "upstreamBaseUrl": "https://nano-gpt.com/api/v1",
+  "host": "127.0.0.1",
+  "port": 8787,
+  "bridgeProtocol": "object",
+  "bridgeModels": "",
+  "includeUsage": "",
+  "debug": false,
+  "rawLogs": false,
+  "logDir": null,
+  "compression": false
+}

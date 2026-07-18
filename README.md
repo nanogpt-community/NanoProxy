@@ -1,8 +1,31 @@
 # NanoProxy
+Fork of [nanogpt-community/NanoProxy](https://github.com/nanogpt-community/NanoProxy).
+## Fork Improvements
+
+
+
+- Live terminal dashboard with colored request log and summary totals
+- `structuredClone()` over `JSON.parse(JSON.stringify())` for deep copies
+- Canonicalize cache for tool-name normalization
+- Extracted `src/logger.js`, `src/headers.js`, `src/config.js` modules
+- `nanoproxy.json` config file support
+- `jsconfig.json` with `checkJs: true`
+- Optional gzip compression (`NANOPROXY_COMPRESSION=1`)
+- `GET /` returns JSON status
+- Path validation warns on duplicate `/v1` segments
+- Fixed `buildUpstreamUrl` query-parameter ordering
+- Fixed `messageEmitted` on StreamingXmlParser
+- Fixed self-referencing singleton patterns in logger and config
+
+---
+A local OpenAI-compatible bridge for NanoGPT.
+
+
 
 NanoProxy is a local OpenAI-compatible bridge for NanoGPT that makes tool-enabled clients work more reliably by rewriting tool-enabled requests into a stricter upstream bridge protocol and translating the model output back into standard OpenAI-style `content`, `reasoning`, and `tool_calls` for the client.
 
 It supports both:
+
 - an OpenCode plugin
 - a standalone local server for OpenAI-compatible tools such as Roo Code, Kilo Code, Zed, Cline-style clients, and similar editors or agents
 
@@ -13,6 +36,7 @@ It also supports optional native-first fallback for selected models through `BRI
 ## What NanoProxy Does
 
 For tool-enabled requests, NanoProxy:
+
 1. rewrites the upstream request into the selected bridge protocol
 2. preserves streaming where possible for reasoning, visible content, and tool calls
 3. incrementally parses the bridged model output
@@ -48,6 +72,7 @@ NanoProxy asks the model to return one JSON turn object shaped like this:
 ```
 
 Field meaning:
+
 - `v`: protocol version
 - `mode`: `tool`, `final`, or `clarify`
 - `message`: user-visible assistant text
@@ -76,6 +101,7 @@ Example:
 ```
 
 How it works:
+
 - `<open>...</open>` carries visible user-facing text
 - tool calls are emitted as XML tags named after the tool
 - tool arguments are passed as child tags inside the tool tag
@@ -186,9 +212,11 @@ opencode
 ```
 
 Optional override:
+
 - `NANOPROXY_LOG_DIR` for the plugin log directory
 
 Default plugin log locations:
+
 - session logs: system temp under `nanoproxy-plugin-logs`
 - raw artifacts: system temp under `nanoproxy-plugin-logs/raw` when raw logging is enabled
 
@@ -280,6 +308,7 @@ Compose uses the same environment model as the server, so you can add values lik
 ## Logging Summary
 
 ### Plugin mode
+
 - off by default
 - enabled by `NANOPROXY_DEBUG=1|true` or `.debug-logging`
 - raw artifacts additionally enabled by `NANOPROXY_RAW_LOGS=1|true`
@@ -287,6 +316,7 @@ Compose uses the same environment model as the server, so you can add values lik
 - one structured session log per plugin run
 
 ### Server mode
+
 - off by default
 - enabled by `NANO_PROXY_DEBUG=1|true` or `.debug-logging`
 - logs go to `Logs/`
@@ -295,6 +325,7 @@ Compose uses the same environment model as the server, so you can add values lik
 ## Reliability Rules
 
 Key behavior:
+
 - bridge activates only for tool-enabled requests
 - requests without tools pass through unchanged
 - object bridge is the default and the XML bridge remains available as an alternative protocol
@@ -316,8 +347,11 @@ NanoProxy/
 |-- server.js
 |-- src/
 |   |-- core.js
+|   |-- headers.js
+|   |-- logger.js
 |   |-- object_bridge.js
 |   `-- plugin.mjs
+|-- jsconfig.json
 `-- toggle-debug.ps1
 ```
 
@@ -336,6 +370,3 @@ Or:
 ```sh
 npm run check
 ```
-
-
-
