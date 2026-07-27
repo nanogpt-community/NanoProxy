@@ -183,38 +183,23 @@ function normalizeToolDefinition(tool) {
     return clone(tool);
 }
 
-let _bridgeModelsAllowlist = undefined;
-let _bridgeModelsParsed = false;
-
-function _getBridgeModelsAllowlist() {
-    if (!_bridgeModelsParsed) {
-        _bridgeModelsParsed = true;
-        const raw = config.bridgeModels;
-        if (raw === undefined) { _bridgeModelsAllowlist = null; }
-        else if (raw.trim() === "") { _bridgeModelsAllowlist = []; }
-        else { _bridgeModelsAllowlist = raw.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean); }
-    }
-    return _bridgeModelsAllowlist;
+function getBridgeModelsAllowlist() {
+    const raw = config.bridgeModels;
+    if (raw === undefined) return null;
+    if (typeof raw !== "string" || raw.trim() === "") return [];
+    return raw.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
 }
 
 function modelNeedsBridge(modelId) {
-    const allowlist = _getBridgeModelsAllowlist();
+    const allowlist = getBridgeModelsAllowlist();
     if (allowlist === null) return true;
     if (allowlist.length === 0) return false;
     const lower = String(modelId || "").toLowerCase();
-    return allowlist.some((part) => lower.includes(part));
+    return allowlist.some((part) => lower === part || lower.startsWith(part + "/") || lower.startsWith(part + ":"));
 }
 
-let _cachedProtocolValue = null;
-let _cachedProtocolRaw = "__init__";
-
 function getBridgeProtocol() {
-    const raw = config.bridgeProtocol;
-    if (raw !== _cachedProtocolRaw) {
-        _cachedProtocolRaw = raw;
-        _cachedProtocolValue = String(raw || "object").trim().toLowerCase() === "object" ? "object" : "xml";
-    }
-    return _cachedProtocolValue;
+    return String(config.bridgeProtocol || "object").trim().toLowerCase() === "object" ? "object" : "xml";
 }
 
 // ---------------------------------------------------------------------------
@@ -400,12 +385,13 @@ function encodeAssistantToolCallsMessage(message, toolNames) {
             ? parsedArgs.value
             : {};
 
+        const escapedName = xmlEscape(fn.name);
         const paramLines = Object.entries(argsObject).map(([name, value]) => {
             const strValue = typeof value === "string" ? value : JSON.stringify(value);
-            return `<${name}>${xmlEscape(strValue)}</${name}>`;
+            return `<${xmlEscape(name)}>${xmlEscape(strValue)}</${xmlEscape(name)}>`;
         });
 
-        parts.push(`<${fn.name}>\n${paramLines.join("\n")}\n</${fn.name}>`);
+        parts.push(`<${escapedName}>\n${paramLines.join("\n")}\n</${escapedName}>`);
     }
 
     return parts.join("\n\n");
@@ -545,6 +531,18 @@ function normalizeToolSpec(tool) {
 }
 
 const _toolRegexCache = new Map();
+function _getToolRegex(toolName) {
+    let re = _toolRegexCache.get(toolName);
+    if (!re) {
+        const escaped = toolName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        re = new RegExp(`<${escaped}(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/${escaped}\\s*>`, "gi");
+        _toolRegexCache.set(toolName, re);
+    } else {
+        re.lastIndex = 0;
+    }
+    return re;
+}
+
 function extractToolBlocks(text, tools) {
     const source = String(text || "");
     if (!Array.isArray(tools) || tools.length === 0) return [];
@@ -553,8 +551,7 @@ function extractToolBlocks(text, tools) {
     for (const tool of tools) {
         const spec = normalizeToolSpec(tool);
         if (!spec || !spec.name) continue;
-        const escaped = spec.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const toolRegex = new RegExp(`<${escaped}(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/${escaped}\\s*>`, "gi");
+        const toolRegex = _getToolRegex(spec.name);
         let toolMatch;
         while ((toolMatch = toolRegex.exec(source))) {
             matches.push({
@@ -586,6 +583,16 @@ function extractGenericXmlArguments(toolName, toolBody, attrs) {
 }
 
 const _argRegexCache = new Map();
+function _getArgRegex(argName) {
+    let re = _argRegexCache.get(argName);
+    if (!re) {
+        const escaped = argName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        re = new RegExp(`<${escaped}(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/${escaped}\\s*>`, "i");
+        _argRegexCache.set(argName, re);
+    }
+    return re;
+}
+
 function buildToolCallFromBlock(block) {
     const toolBody = block.toolBody;
     const toolArgsDef = Array.isArray(block.toolArgsDef) ? block.toolArgsDef : [];
@@ -610,8 +617,7 @@ function buildToolCallFromBlock(block) {
 
     for (const argDef of toolArgsDef) {
         const argName = argDef.name;
-        const argNameEscaped = argName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const argRegex = new RegExp(`<${argNameEscaped}(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/${argNameEscaped}\\s*>`, "i");
+        const argRegex = _getArgRegex(argName);
         const argMatch = argRegex.exec(toolBody);
 
         let extractedValue = null;
@@ -702,6 +708,41 @@ function isInvalidBridgeCompletion(parsed, tools) {
 // ---------------------------------------------------------------------------
 
 /** @param {string} text @param {string} reasoning @param {NormalizedTool[]} tools @returns {BridgeResult} */
+function buildInvalidBridgeRetryBuffer(rewrittenBody, protocol = "xml") {
+    const retryBody = clone(rewrittenBody);
+    retryBody.messages = Array.isArray(retryBody.messages) ? retryBody.messages.slice() : [];
+    const systemText = retryBody.messages
+        .filter((message) => message && message.role === "system")
+        .map((message) => typeof message.content === "string" ? message.content : "")
+        .join("\n");
+    const manifestMatch = systemText.match(/Tool manifest:\n([\s\S]*?)(?:\n\nAdditional system instructions|\n*$)/);
+    const manifestParsed = manifestMatch ? tryParseJson(manifestMatch[1].trim()) : { ok: false };
+    const toolNames = manifestParsed.ok && Array.isArray(manifestParsed.value)
+        ? manifestParsed.value.map((tool) => tool && tool.name).filter(Boolean)
+        : [];
+    const hasAttemptCompletion = toolNames.includes("attempt_completion");
+    const hasFollowup = toolNames.includes("ask_followup_question");
+    const content = protocol === "object"
+        ? [
+            "Your previous response ended with no visible content and no tool call. That is invalid for this tool-enabled turn.",
+            "You must now return exactly one JSON object that follows the Structured Turn Contract. No markdown. No prose outside the JSON object. Do not return an empty response.",
+            toolNames.length ? `Available tools: ${toolNames.join(", ")}.` : "",
+            hasAttemptCompletion ? 'If the task is complete, use mode "tool" and call "attempt_completion". Do not use mode "final" for completion.' : 'If no tool is needed, use mode "final" with a non-empty message.',
+            hasFollowup ? 'If you need input from the user or are answering a conversational prompt, use mode "tool" and call "ask_followup_question". Do not use mode "clarify".' : 'If you need input from the user, use mode "clarify" with a non-empty question.',
+            'If work remains, use mode "tool" with one of the available tools.'
+        ].filter(Boolean).join("\n")
+        : [
+            "Your previous response ended with no visible content and no XML tool call. That is invalid for this tool-enabled turn.",
+            "Do not return an empty response.",
+            toolNames.length ? `Available tools: ${toolNames.join(", ")}.` : "",
+            hasAttemptCompletion ? 'If the task is complete, emit the "attempt_completion" tool call.' : "If no tool is needed, provide a normal visible reply.",
+            hasFollowup ? 'If you need input from the user or are answering a conversational prompt, emit the "ask_followup_question" tool call.' : "",
+            "If work remains, emit the XML tool call now."
+        ].filter(Boolean).join("\n");
+    retryBody.messages.push({ role: "system", content });
+    return Buffer.from(JSON.stringify(retryBody), "utf8");
+}
+
 function buildBridgeResultFromText(text, reasoning, tools) {
     if (getBridgeProtocol() === "object") {
         return buildBridgeResultFromObjectText(text, reasoning, tools);
@@ -776,7 +817,8 @@ function buildAggregateFromChatCompletion(payload) {
             ? message.reasoning_content
             : (typeof message.reasoning === "string" ? message.reasoning : ""),
         content: contentPartsToText(message.content),
-        finishReason: choice && choice.finish_reason != null ? choice.finish_reason : null
+        finishReason: choice && choice.finish_reason != null ? choice.finish_reason : null,
+        cost: payload?.x_nanogpt_pricing?.amount ?? payload?.usage?.cost ?? null
     };
 }
 
@@ -787,11 +829,28 @@ function looksLikeXmlToolPayload(text) {
     return /<([A-Za-z_][\w.-]*)(?:\s+[^>]*)?>[\s\S]*<\/\1\s*>/.test(source);
 }
 
+function looksLikeObjectBridgePayload(text) {
+    const source = String(text || "").trim();
+    if (!source) return false;
+    
+    if (source.includes('"v"') && source.includes('"mode"')) {
+        const parsedBridge = parseObjectBridgeAssistantText(source, []);
+        if (parsedBridge && parsedBridge.kind !== "invalid") return true;
+
+        const fenceMatch = source.match(/```(?:json)?\s*\n([\s\S]*?)\n```/i);
+        if (fenceMatch && fenceMatch[1].includes('"v"') && fenceMatch[1].includes('"mode"')) return true;
+        
+        if (source.startsWith("{")) return true;
+    }
+    return false;
+}
+
 function shouldFallbackFromNativeText(text, finishReason) {
     const content = contentPartsToText(text).trim();
     if (finishReason === "tool_calls") return true;
     if (!content) return true;
     if (looksLikeXmlToolPayload(content)) return true;
+    if (looksLikeObjectBridgePayload(content)) return true;
     return false;
 }
 
@@ -858,7 +917,11 @@ function sseLine(payload) {
 
 function applyChunkToAggregate(aggregate, chunk) {
     const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : null;
-    if (!choice) return;
+    if (!choice) {
+        if (chunk.usage) aggregate.usage = chunk.usage;
+        if (chunk.x_nanogpt_pricing) aggregate.cost = chunk.x_nanogpt_pricing?.amount ?? aggregate.cost;
+        return;
+    }
     aggregate.id = aggregate.id || chunk.id || ("chatcmpl_" + randomUUID());
     aggregate.model = aggregate.model || chunk.model || null;
     aggregate.created = aggregate.created || chunk.created || Math.floor(Date.now() / 1000);
@@ -868,6 +931,7 @@ function applyChunkToAggregate(aggregate, chunk) {
     if (typeof delta.content === "string") aggregate.content += delta.content;
     if (choice.finish_reason != null) aggregate.finishReason = choice.finish_reason;
     if (chunk.usage) aggregate.usage = chunk.usage;
+    if (chunk.x_nanogpt_pricing) aggregate.cost = chunk.x_nanogpt_pricing?.amount ?? aggregate.cost;
 }
 
 /** @param {string} text @returns {Aggregate} */
@@ -879,7 +943,8 @@ function parseSSETranscript(text) {
         reasoning: "",
         content: "",
         finishReason: null,
-        usage: null
+        usage: null,
+        cost: null
     };
     const chunks = String(text || "").split(/\n\n+/);
     for (const block of chunks) {
@@ -1121,6 +1186,7 @@ module.exports = {
     isInvalidBridgeCompletion,
     buildBridgeResultFromText,
     buildBridgeResultFromObjectText,
+    buildInvalidBridgeRetryBuffer,
     buildAggregateFromChatCompletion,
     acceptNativeJson,
     acceptNativeSSE,

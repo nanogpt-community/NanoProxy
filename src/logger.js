@@ -21,6 +21,7 @@ const MAX_DISPLAY = 10;
 const HEADERS = ["#", "Method", "Path", "Status", "Model", "Mode", "Tools", "Tokens", "Cost", "Finish"];
 const ALIGNS = ["right", "left", "left", "left", "left", "left", "right", "left", "right", "left"];
 const MIN_WIDTHS = HEADERS.map(h => h.length);
+const ANSI_ENABLED = !!process.stdout.isTTY;
 
 const displayRows = [];
 const totals = { requests: 0, tokensIn: 0, tokensOut: 0, tokensTotal: 0, cached: 0, cost: 0, toolCalls: 0, bridges: 0 };
@@ -59,6 +60,7 @@ function rowValues(r) {
 
 /** Colorize value by column index */
 function colorize(val, idx, row) {
+    if (!ANSI_ENABLED) return val;
     switch (idx) {
         case 0: return `${C.cyan}${val}${C.reset}`;
         case 1: return `${C.white}${val}${C.reset}`;
@@ -93,7 +95,9 @@ function buildSep(widths, connector) {
 }
 
 function buildHeader(widths) {
-    const cells = HEADERS.map((h, i) => pad(`${C.bold}${C.white}${h}${C.reset}`, widths[i], ALIGNS[i]));
+    const label = ANSI_ENABLED ? `${C.bold}${C.white}` : "";
+    const reset = ANSI_ENABLED ? C.reset : "";
+    const cells = HEADERS.map((h, i) => pad(`${label}${h}${reset}`, widths[i], ALIGNS[i]));
     return ` ${cells.join(" │ ")}`;
 }
 
@@ -110,10 +114,12 @@ function buildSummaryLine() {
     const t = totals;
     const tok = `${t.tokensIn}->${t.tokensOut}/${t.tokensTotal}`;
     const cachedStr = t.cached > 0 ? ` (${t.cached} cached)` : "";
+    if (!ANSI_ENABLED) return ` Total: ${t.requests} requests │ ${tok}${cachedStr} │ $${t.cost.toFixed(5)} │ ${t.toolCalls} tool calls │ ${t.bridges} bridged`;
     return `${C.bold}${C.white} Total:${C.reset} ${C.cyan}${t.requests}${C.reset} requests │ ${C.blue}${tok}${cachedStr}${C.reset} │ ${C.dimYellow}$${t.cost.toFixed(5)}${C.reset} │ ${C.magenta}${t.toolCalls} tool calls${C.reset} │ ${C.yellow}${t.bridges} bridged${C.reset}`;
 }
 
 function redrawTable() {
+    if (!ANSI_ENABLED) return;
     const widths = calcWidths();
     const padded = [...displayRows];
     while (padded.length < MAX_DISPLAY) padded.push({});
@@ -164,14 +170,32 @@ function logRequestSummary(opts) {
     redrawTable();
 }
 
-/** @param {string} logDir @param {boolean} enabled @returns {{log: function(string): void, logSection: function(string, any): void, sessionLog: string|null}} */
+/** @param {string} logDir @param {boolean} enabled @returns {{log: function(string): void, logSection: function(string, any): void, flush: function(): void, sessionLog: string|null}} */
 function createSessionLogger(logDir, enabled) {
     const sessionStart = new Date().toISOString().replace(/[:.]/g, "-");
     const sessionLog = enabled ? require("node:path").join(logDir, `session-${sessionStart}.log`) : null;
+    let pending = [];
+    const FLUSH_INTERVAL_MS = 250;
+    let timer = null;
+    function scheduleFlush() {
+        if (timer || pending.length === 0) return;
+        timer = setInterval(() => {
+            if (pending.length === 0) {
+                clearInterval(timer);
+                timer = null;
+                return;
+            }
+            const chunk = pending.join("");
+            pending = [];
+            try { fs.appendFileSync(sessionLog, chunk, "utf8"); } catch { }
+        }, FLUSH_INTERVAL_MS);
+        if (typeof timer.unref === "function") timer.unref();
+    }
 
     function log(text) {
         if (!enabled || !sessionLog) return;
-        try { fs.appendFileSync(sessionLog, String(text) + "\n", "utf8"); } catch { }
+        pending.push(String(text) + "\n");
+        scheduleFlush();
     }
 
     function logSection(title, content) {
@@ -180,7 +204,14 @@ function createSessionLogger(logDir, enabled) {
         log("");
     }
 
-    return { log, logSection, sessionLog };
+    function flush() {
+        if (pending.length === 0) return;
+        const chunk = pending.join("");
+        pending = [];
+        try { fs.appendFileSync(sessionLog, chunk, "utf8"); } catch { }
+    }
+
+    return { log, logSection, flush, sessionLog };
 }
 
 module.exports = { C, pad, truncate, logRequestSummary, createSessionLogger };

@@ -38,7 +38,7 @@ const config = {
 
     // Bridge
     bridgeProtocol: process.env.BRIDGE_PROTOCOL || fileConfig.bridgeProtocol || "object",
-    bridgeModels: process.env.BRIDGE_MODELS ?? fileConfig.bridgeModels ?? "",
+    bridgeModels: process.env.BRIDGE_MODELS ?? fileConfig.bridgeModels,
     includeUsage: process.env.NANOPROXY_INCLUDE_USAGE ?? fileConfig.includeUsage ?? "",
 
     // Debug / Logging
@@ -48,6 +48,11 @@ const config = {
 
     // Compression
     compression: process.env.NANOPROXY_COMPRESSION === "1" || process.env.NANOPROXY_COMPRESSION === "true" || fileConfig.compression || false,
+
+    // Limits
+    maxBodyBytes: Number(process.env.NANOPROXY_MAX_BODY_BYTES || fileConfig.maxBodyBytes || 20 * 1024 * 1024),
+    upstreamTimeoutMs: Number(process.env.NANOPROXY_UPSTREAM_TIMEOUT_MS || fileConfig.upstreamTimeoutMs || 120000),
+    shutdownTimeoutMs: Number(process.env.NANOPROXY_SHUTDOWN_TIMEOUT_MS || fileConfig.shutdownTimeoutMs || 10000),
 };
 
 module.exports = config;

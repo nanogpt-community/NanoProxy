@@ -10,6 +10,15 @@ const _encoder = new TextEncoder()
 const _decoder = new TextDecoder()
 
 const FETCH_PATCH_KEY = Symbol.for("nanoproxy.fetchPatch")
+const ORIGINAL_FETCH_KEY = Symbol.for("nanoproxy.originalFetch")
+const MAX_BODY_BYTES = Number(process.env.NANOPROXY_MAX_BODY_BYTES || 20 * 1024 * 1024)
+const UPSTREAM_TIMEOUT_MS = Number(process.env.NANOPROXY_UPSTREAM_TIMEOUT_MS || 120000)
+
+function uninstallFetchPatch() {
+    const original = globalThis[ORIGINAL_FETCH_KEY]
+    if (original && globalThis.fetch !== original) globalThis.fetch = original
+    delete globalThis[FETCH_PATCH_KEY]
+}
 
 function createPluginHooks(client) {
     let announced = false
@@ -83,11 +92,35 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
         }
     }
 
+    let _logPending = []
+    let _logTimer = null
+    const _LOG_FLUSH_MS = 250
+    function _scheduleLogFlush() {
+        if (_logTimer || _logPending.length === 0) return
+        _logTimer = setInterval(() => {
+            if (_logPending.length === 0) {
+                clearInterval(_logTimer)
+                _logTimer = null
+                return
+            }
+            const chunk = _logPending.join("")
+            _logPending = []
+            try { appendFileSync(SESSION_LOG, chunk) } catch { }
+        }, _LOG_FLUSH_MS)
+        if (typeof _logTimer.unref === "function") _logTimer.unref()
+    }
+
     function log(text) {
         if (!VERBOSE || !SESSION_LOG) return
-        try {
-            appendFileSync(SESSION_LOG, String(text) + "\n")
-        } catch { }
+        _logPending.push(String(text) + "\n")
+        _scheduleLogFlush()
+    }
+
+    function flushLogs() {
+        if (_logPending.length === 0) return
+        const chunk = _logPending.join("")
+        _logPending = []
+        try { appendFileSync(SESSION_LOG, chunk) } catch { }
     }
 
     function logSection(title, content) {
@@ -122,6 +155,69 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
 
     function writeRawDebugJson(name, value, force = false) {
         writeRawDebugFile(name, JSON.stringify(value, null, 2), force)
+    }
+
+    function buildHeaders(input, init, bodyBytes) {
+        const headers = new Headers(input instanceof Request ? input.headers : {})
+        if (init?.headers) {
+            const initHeaders = new Headers(init.headers)
+            for (const [k, v] of initHeaders) headers.set(k, v)
+        }
+        headers.set("content-type", "application/json")
+        headers.set("content-length", String(bodyBytes.length))
+        return headers
+    }
+
+    async function readBodyWithCap(input, init) {
+        const clonedRequest = input instanceof Request ? input.clone() : null
+        if (clonedRequest) {
+            const declaredLength = Number(clonedRequest.headers.get("content-length"))
+            if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
+                return { tooLarge: true, body: null }
+            }
+            const reader = clonedRequest.body && clonedRequest.body.getReader ? clonedRequest.body.getReader() : null
+            if (!reader) {
+                try { return { tooLarge: false, body: await clonedRequest.text() } } catch { return { tooLarge: false, body: null } }
+            }
+            const decoder = _decoder
+            let total = 0
+            let text = ""
+            while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                total += value.byteLength
+                if (total > MAX_BODY_BYTES) return { tooLarge: true, body: null }
+                text += decoder.decode(value, { stream: true })
+            }
+            text += decoder.decode()
+            return { tooLarge: false, body: text }
+        }
+        if (typeof init?.body === "string") {
+            return { tooLarge: init.body.length > MAX_BODY_BYTES, body: init.body }
+        }
+        if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) {
+            const len = init.body.byteLength ?? init.body.length ?? 0
+            if (len > MAX_BODY_BYTES) return { tooLarge: true, body: null }
+            return { tooLarge: false, body: _decoder.decode(init.body) }
+        }
+        if (init?.body != null && typeof init.body.text === "function") {
+            try {
+                const text = await init.body.text()
+                return { tooLarge: text.length > MAX_BODY_BYTES, body: text }
+            } catch { return { tooLarge: false, body: null } }
+        }
+        return { tooLarge: false, body: null }
+    }
+
+    async function fetchWithTimeout(target, initOptions) {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(new Error("upstream_timeout")), UPSTREAM_TIMEOUT_MS)
+        if (typeof timer.unref === "function") timer.unref()
+        try {
+            return await originalFetch(target, { ...initOptions, signal: controller.signal })
+        } finally {
+            clearTimeout(timer)
+        }
     }
 
     function sanitizeBufferedResponseHeaders(headersLike, bodyLength, contentTypeOverride) {
@@ -410,12 +506,16 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
                                 const retryBody = buildInvalidBridgeRetryBuffer(transformed.rewritten, transformed.protocol)
                                 const retryHeaders = new Headers(requestHeaders)
                                 retryHeaders.set("content-length", String(retryBody.length))
-                                const retryResponse = await originalFetch(urlStr, {
+                                const retryResponse = await fetchWithTimeout(urlStr, {
                                     ...init,
                                     method: "POST",
                                     headers: retryHeaders,
                                     body: retryBody
                                 })
+                                if (!retryResponse.ok || !retryResponse.body) {
+                                    invalidNotice = `[NanoProxy] Retry failed: upstream returned status ${retryResponse.status}.`
+                                    break
+                                }
                                 reader = retryResponse.body.getReader()
                                 appendRawDebugFile(rawSseFile, "\n# retry=invalid_empty\n")
                                 continue
@@ -465,8 +565,11 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
         })
     }
 
-    const originalFetch = globalThis[FETCH_PATCH_KEY]?.originalFetch || globalThis.fetch
-    globalThis[FETCH_PATCH_KEY] = { installed: true, originalFetch }
+    if (!globalThis[ORIGINAL_FETCH_KEY]) {
+        globalThis[ORIGINAL_FETCH_KEY] = globalThis[FETCH_PATCH_KEY]?.originalFetch || globalThis.fetch
+    }
+    const originalFetch = globalThis[ORIGINAL_FETCH_KEY]
+    globalThis[FETCH_PATCH_KEY] = { installed: true, originalFetch, uninstall: uninstallFetchPatch }
     log("")
     log(`${"=".repeat(80)}`)
     log(`PLUGIN SESSION | ${new Date().toISOString()} | pid=${process.pid}`)
@@ -487,17 +590,16 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
         log(`${"=".repeat(80)}`)
         if (method !== "POST") return originalFetch(input, init, ...rest)
 
-        const clonedRequest = input instanceof Request ? input.clone() : null
-        let bodyText
-        try {
-            if (clonedRequest) bodyText = await clonedRequest.text()
-            else if (typeof init?.body === "string") bodyText = init.body
-            else if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) bodyText = _decoder.decode(init.body)
-            else if (init?.body != null && typeof init.body.text === "function") bodyText = await init.body.text()
-            else return originalFetch(input, init, ...rest)
-        } catch {
-            return originalFetch(input, init, ...rest)
+        const readResult = await readBodyWithCap(input, init)
+        if (readResult.tooLarge) {
+            log(`--- BODY TOO LARGE | request=${requestId} | limit=${MAX_BODY_BYTES} ---\n`)
+            return new Response(JSON.stringify({ error: { code: "body_too_large", message: `Request body exceeds ${MAX_BODY_BYTES} bytes.` } }), {
+                status: 413,
+                headers: { "content-type": "application/json" }
+            })
         }
+        if (readResult.body == null) return originalFetch(input, init, ...rest)
+        const bodyText = readResult.body
 
         const parsed = tryParseJson(bodyText)
         if (!parsed.ok) return originalFetch(input, init, ...rest)
@@ -505,14 +607,8 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
         if (!requestNeedsXmlBridge(requestBody)) {
             const passthroughBodyText = JSON.stringify(requestBody)
             const passthroughBodyBytes = _encoder.encode(passthroughBodyText)
-            const passthroughHeaders = new Headers(input instanceof Request ? input.headers : {})
-            if (init?.headers) {
-                const initHeaders = new Headers(init.headers)
-                for (const [k, v] of initHeaders) passthroughHeaders.set(k, v)
-            }
-            passthroughHeaders.set("content-type", "application/json")
-            passthroughHeaders.set("content-length", String(passthroughBodyBytes.length))
-            return originalFetch(urlStr, {
+            const passthroughHeaders = buildHeaders(input, init, passthroughBodyBytes)
+            return fetchWithTimeout(urlStr, {
                 ...init,
                 method: "POST",
                 headers: passthroughHeaders,
@@ -526,14 +622,8 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
             log("")
             const nativeBodyText = JSON.stringify(requestBody)
             const nativeBodyBytes = _encoder.encode(nativeBodyText)
-            const nativeHeaders = new Headers(input instanceof Request ? input.headers : {})
-            if (init?.headers) {
-                const initHeaders = new Headers(init.headers)
-                for (const [k, v] of initHeaders) nativeHeaders.set(k, v)
-            }
-            nativeHeaders.set("content-type", "application/json")
-            nativeHeaders.set("content-length", String(nativeBodyBytes.length))
-            const nativeResponse = await originalFetch(urlStr, {
+            const nativeHeaders = buildHeaders(input, init, nativeBodyBytes)
+            const nativeResponse = await fetchWithTimeout(urlStr, {
                 ...init,
                 method: "POST",
                 headers: nativeHeaders,
@@ -586,15 +676,9 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
         })
 
         const newBodyBytes = _encoder.encode(JSON.stringify(transformed.rewritten))
-        const headers = new Headers(input instanceof Request ? input.headers : {})
-        if (init?.headers) {
-            const initHeaders = new Headers(init.headers)
-            for (const [k, v] of initHeaders) headers.set(k, v)
-        }
-        headers.set("content-type", "application/json")
-        headers.set("content-length", String(newBodyBytes.length))
+        const headers = buildHeaders(input, init, newBodyBytes)
 
-        const response = await originalFetch(urlStr, {
+        const response = await fetchWithTimeout(urlStr, {
             ...init,
             method: "POST",
             headers,
@@ -632,12 +716,19 @@ export const NanoProxyPlugin = async function NanoProxyPlugin(ctx = {}) {
                 const retryBody = buildInvalidBridgeRetryBuffer(transformed.rewritten, transformed.protocol)
                 const retryHeaders = new Headers(headers)
                 retryHeaders.set("content-length", String(retryBody.length))
-                const retryResponse = await originalFetch(urlStr, {
+                const retryResponse = await fetchWithTimeout(urlStr, {
                     ...init,
                     method: "POST",
                     headers: retryHeaders,
                     body: retryBody
                 })
+                if (!retryResponse.ok) {
+                    const errBuf = await retryResponse.arrayBuffer()
+                    return new Response(errBuf, {
+                        status: retryResponse.status,
+                        headers: sanitizeBufferedResponseHeaders(retryResponse.headers, errBuf.byteLength)
+                    })
+                }
                 const retryText = await retryResponse.text()
                 const retryParsed = tryParseJson(retryText)
                 if (retryParsed.ok) {

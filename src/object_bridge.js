@@ -1,6 +1,7 @@
 "use strict";
 
 const { randomUUID } = require("node:crypto");
+const config = require("./config.js");
 
 function tryParseJson(text) {
   try {
@@ -172,7 +173,7 @@ function translateMessagesForObjectBridge(messages) {
 
 function transformRequestForObjectBridge(body, normalizedTools) {
   const rewritten = structuredClone(body);
-  const includeUsageRaw = process.env.NANOPROXY_INCLUDE_USAGE;
+  const includeUsageRaw = config.includeUsage;
   const includeUsage =
     includeUsageRaw == null || includeUsageRaw === ""
       ? true
@@ -429,8 +430,6 @@ function normalizeObjectBridgeResponseText(text) {
     candidates.push(normalized);
   };
 
-  pushCandidate(source);
-
   const unfenced = unwrapJsonCodeFence(source);
   if (unfenced) pushCandidate(unfenced);
 
@@ -442,6 +441,8 @@ function normalizeObjectBridgeResponseText(text) {
     if (unfencedLegacy) pushCandidate(unfencedLegacy);
   }
 
+  pushCandidate(source);
+
   for (const candidate of candidates) {
     const parsedWhole = tryParseJson(candidate);
     if (parsedWhole.ok) {
@@ -449,13 +450,24 @@ function normalizeObjectBridgeResponseText(text) {
       if (normalized) return JSON.stringify(normalized);
     }
 
-    const extracted = extractTopLevelJsonValue(candidate);
-    if (extracted) {
+    let searchStart = 0;
+    while (searchStart < candidate.length) {
+      const extracted = extractTopLevelJsonValue(candidate.slice(searchStart));
+      if (!extracted) break;
+      
       const parsedValue = tryParseJson(extracted.valueText);
       if (parsedValue.ok) {
         const normalized = normalizeBridgeTurnPayload(parsedValue.value);
-        if (normalized) return JSON.stringify(normalized);
+        if (normalized) {
+          // If the model had some conversational text before the JSON, include it in the message if no message was provided inside the JSON.
+          const prefixProse = candidate.slice(0, searchStart + extracted.prefix.length).trim();
+          if (prefixProse && !normalized.message) {
+            normalized.message = prefixProse;
+          }
+          return JSON.stringify(normalized);
+        }
       }
+      searchStart += extracted.prefix.length + extracted.valueText.length;
     }
   }
 
@@ -964,6 +976,7 @@ class StreamingObjectParser {
     this.toolCallsArrayStart = -1;
     this.toolCallsCursor = -1;
     this.objectClosed = false;
+    this._keyLastIndex = Object.create(null);
   }
 
   _skipWhitespace(index) {
@@ -973,7 +986,15 @@ class StreamingObjectParser {
   }
 
   _findKeyStart(key, fromIndex = 0) {
-    return this.buffer.indexOf(`"${key}"`, fromIndex);
+    const needle = `"${key}"`;
+    const start = Math.max(fromIndex, this._keyLastIndex[key] || 0);
+    const idx = this.buffer.indexOf(needle, start);
+    if (idx >= 0) {
+      this._keyLastIndex[key] = idx + needle.length;
+      return idx;
+    }
+    if (start > (this._keyLastIndex[key] || 0)) this._keyLastIndex[key] = start;
+    return -1;
   }
 
   _findValueStartAfterKey(key, fromIndex = 0) {
@@ -1085,14 +1106,23 @@ class StreamingObjectParser {
 
   feed(text) {
     if (this.invalid) return;
+    if (this.objectClosed) return;
     this.buffer += String(text || '');
     this._scanHeader();
     this._scanToolCalls();
+    if (this.objectClosed) {
+      this.buffer = "";
+      this._keyLastIndex = Object.create(null);
+    }
   }
 
   flush() {
+    if (this.invalid) return;
     this._scanHeader();
     this._scanToolCalls();
+    if (this.mode === 'tool' && this.toolCallsArrayStart >= 0 && !this.objectClosed) {
+      this.invalid = true;
+    }
   }
 }
 

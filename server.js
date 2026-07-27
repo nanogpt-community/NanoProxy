@@ -8,7 +8,7 @@ const zlib = require("node:zlib");
 const config = require("./src/config.js");
 const core = require("./src/core.js");
 const { logRequestSummary, createSessionLogger, C } = require("./src/logger.js");
-const { redactHeaders, buildUpstreamHeaders, copyResponseHeaders } = require("./src/headers.js");
+const { redactHeaders, buildUpstreamHeaders, copyResponseHeaders, UPSTREAM_STRIP_HEADERS } = require("./src/headers.js");
 
 const {
     tryParseJson,
@@ -23,7 +23,9 @@ const {
     sseLine,
     createStreamingBridgeParser,
     buildBridgeResultFromText,
-    getBridgeProtocol
+    parseSSETranscript,
+    getBridgeProtocol,
+    buildInvalidBridgeRetryBuffer
 } = core;
 
 const LISTEN_HOST = config.host;
@@ -38,13 +40,27 @@ const { log, logSection, sessionLog: SESSION_LOG } = createSessionLogger(LOG_DIR
 let requestCounter = 0;
 
 function buildUpstreamUrl(requestPath) {
+    let suffix = String(requestPath || "").replace(/^\/+/, "");
     const base = UPSTREAM_BASE_URL.replace(/\/+$/, "");
-    const suffix = String(requestPath || "").replace(/^\/+/, "");
+    if (base.toLowerCase().endsWith("/v1") && suffix.toLowerCase().startsWith("v1/")) {
+        suffix = suffix.slice(3);
+    }
     return `${base}/${suffix}`;
 }
 async function readRequestBody(req) {
+    const max = config.maxBodyBytes;
     const chunks = [];
-    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    let total = 0;
+    for await (const chunk of req) {
+        total += chunk.length;
+        if (total > max) {
+            const error = new Error("Request body exceeds limit");
+            error.statusCode = 413;
+            error.code = "body_too_large";
+            throw error;
+        }
+        chunks.push(Buffer.from(chunk));
+    }
     return Buffer.concat(chunks);
 }
 
@@ -62,65 +78,42 @@ function clientAcceptsGzip(req) {
     return String(req.headers["accept-encoding"] || "").includes("gzip");
 }
 
-function compressIfPossible(req, res, body, contentType) {
+function writeCompressed(req, res, status, headers, body) {
     if (clientAcceptsGzip(req) && body.length > 256) {
         const compressed = zlib.gzipSync(body);
-        res.writeHead(200, {
-            "content-type": contentType,
-            "content-length": String(compressed.length),
-            "content-encoding": "gzip",
-            "vary": "Accept-Encoding",
-        });
+        const merged = { ...headers, "content-length": String(compressed.length), "content-encoding": "gzip", "vary": "Accept-Encoding" };
+        res.writeHead(status, merged);
         res.end(compressed);
     } else {
-        res.writeHead(200, {
-            "content-type": contentType,
-            "content-length": String(body.length),
-        });
+        const merged = { ...headers, "content-length": String(body.length) };
+        res.writeHead(status, merged);
         res.end(body);
     }
 }
-async function fetchUpstream(req, upstreamUrl, bodyBuffer) {
-    return fetch(upstreamUrl, {
-        method: req.method,
-        headers: buildUpstreamHeaders(req.headers, bodyBuffer.length),
-        body: ["GET", "HEAD"].includes(req.method) ? undefined : bodyBuffer,
-    });
-}
 
-function buildInvalidBridgeRetryBuffer(rewrittenBody, protocol = "xml") {
-    const retryBody = structuredClone(rewrittenBody);
-    retryBody.messages = Array.isArray(retryBody.messages) ? retryBody.messages.slice() : [];
-    const systemText = retryBody.messages
-        .filter((message) => message && message.role === "system")
-        .map((message) => typeof message.content === "string" ? message.content : "")
-        .join("\n");
-    const manifestMatch = systemText.match(/Tool manifest:\n([\s\S]*?)(?:\n\nAdditional system instructions|\n*$)/);
-    const manifestParsed = manifestMatch ? tryParseJson(manifestMatch[1].trim()) : { ok: false };
-    const toolNames = manifestParsed.ok && Array.isArray(manifestParsed.value)
-        ? manifestParsed.value.map((tool) => tool && tool.name).filter(Boolean)
-        : [];
-    const hasAttemptCompletion = toolNames.includes("attempt_completion");
-    const hasFollowup = toolNames.includes("ask_followup_question");
-    const content = protocol === "object"
-        ? [
-            "Your previous response ended with no visible content and no tool call. That is invalid for this tool-enabled turn.",
-            "You must now return exactly one JSON object that follows the Structured Turn Contract. No markdown. No prose outside the JSON object. Do not return an empty response.",
-            toolNames.length ? `Available tools: ${toolNames.join(", ")}.` : "",
-            hasAttemptCompletion ? 'If the task is complete, use mode "tool" and call "attempt_completion". Do not use mode "final" for completion.' : 'If no tool is needed, use mode "final" with a non-empty message.',
-            hasFollowup ? 'If you need input from the user or are answering a conversational prompt, use mode "tool" and call "ask_followup_question". Do not use mode "clarify".' : 'If you need input from the user, use mode "clarify" with a non-empty question.',
-            'If work remains, use mode "tool" with one of the available tools.'
-        ].filter(Boolean).join("\n")
-        : [
-            "Your previous response ended with no visible content and no XML tool call. That is invalid for this tool-enabled turn.",
-            "Do not return an empty response.",
-            toolNames.length ? `Available tools: ${toolNames.join(", ")}.` : "",
-            hasAttemptCompletion ? 'If the task is complete, emit the "attempt_completion" tool call.' : "If no tool is needed, provide a normal visible reply.",
-            hasFollowup ? 'If you need input from the user or are answering a conversational prompt, emit the "ask_followup_question" tool call.' : "",
-            "If work remains, emit the XML tool call now."
-        ].filter(Boolean).join("\n");
-    retryBody.messages.push({ role: "system", content });
-    return Buffer.from(JSON.stringify(retryBody), "utf8");
+function compressIfPossible(req, res, body, contentType) {
+    writeCompressed(req, res, 200, { "content-type": contentType }, body);
+}
+async function fetchUpstream(req, upstreamUrl, bodyBuffer) {
+    const upstreamController = new AbortController();
+    const timeoutMs = config.upstreamTimeoutMs;
+    const timeoutHandle = setTimeout(() => upstreamController.abort(new Error("upstream_timeout")), timeoutMs);
+    if (typeof timeoutHandle.unref === "function") timeoutHandle.unref();
+    const onClientClose = () => {
+        try { upstreamController.abort(new Error("client_closed")); } catch { }
+    };
+    req.once("close", onClientClose);
+    try {
+        return await fetch(upstreamUrl, {
+            method: req.method,
+            headers: buildUpstreamHeaders(req.headers, bodyBuffer.length),
+            body: ["GET", "HEAD"].includes(req.method) ? undefined : bodyBuffer,
+            signal: upstreamController.signal,
+        });
+    } finally {
+        clearTimeout(timeoutHandle);
+        req.removeListener("close", onClientClose);
+    }
 }
 
 async function proxyRequest(req, res) {
@@ -142,9 +135,9 @@ async function proxyRequest(req, res) {
         return;
     }
 
-    // Path validation: warn about duplicate /v1/ prefix
-    if ((req.url || "").startsWith("/v1/")) {
-        console.log(`${C.yellow}[NanoProxy] Warning: path starts with /v1/ but upstream already includes /api/v1 — likely 400.${C.reset}`);
+    // Path validation: warn about duplicate /v1/ prefix (auto-strip handled in buildUpstreamUrl)
+    if ((req.url || "").startsWith("/v1/") && UPSTREAM_BASE_URL.replace(/\/+$/, "").toLowerCase().endsWith("/v1")) {
+        log(`--- PATH FIX | stripped leading /v1 from ${req.url} (upstream already includes /v1) ---\n`);
     }
 
     requestCounter++;
@@ -212,11 +205,24 @@ async function proxyRequest(req, res) {
         log("");
 
         if (nativeSucceeded) {
+            let nativeUsage = null;
+            let nativeCost = null;
+            if (contentType.includes("application/json") && bufferedText) {
+                const nativeJson = tryParseJson(bufferedText);
+                if (nativeJson.ok) {
+                    nativeUsage = nativeJson.value?.usage || null;
+                    nativeCost = nativeJson.value?.x_nanogpt_pricing?.amount ?? nativeJson.value?.usage?.cost ?? null;
+                }
+            } else if (contentType.includes("text/event-stream") && bufferedText) {
+                const nativeAggregate = parseSSETranscript(bufferedText);
+                nativeUsage = nativeAggregate.usage;
+                nativeCost = nativeAggregate.cost ?? nativeAggregate.usage?.cost ?? null;
+            }
             copyResponseHeaders(upstreamResponse.headers, res, bufferedBody ? bufferedBody.length : undefined);
             res.writeHead(upstreamResponse.status);
             if (bufferedBody) res.end(bufferedBody);
             else res.end();
-            logRequestSummary({ reqNum, method: req.method, url: req.url, status: upstreamResponse.status, bridgeMode: "native", model: requestBody?.model });
+            logRequestSummary({ reqNum, method: req.method, url: req.url, status: upstreamResponse.status, bridgeMode: "native", model: requestBody?.model, usage: nativeUsage, cost: nativeCost });
 
             return;
         }
@@ -318,6 +324,7 @@ async function proxyRequest(req, res) {
         let finalFinishReason = null;
         let invalidNotice = null;
         let upstreamUsage = null;
+        let upstreamCost = null;
 
         for (let attempt = 0; attempt < 2; attempt++) {
             if (!(activeResponse.ok && activeContentType.includes("text/event-stream"))) break;
@@ -369,6 +376,7 @@ async function proxyRequest(req, res) {
                     if (payload.model) model = payload.model;
                     if (payload.created) created = payload.created;
                     if (payload.usage) upstreamUsage = payload.usage;
+                    if (payload.x_nanogpt_pricing) upstreamCost = payload.x_nanogpt_pricing?.amount ?? upstreamCost;
                     const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
                     if (!choice) continue;
                     if (choice.finish_reason != null) upstreamFinishReason = choice.finish_reason;
@@ -492,7 +500,7 @@ async function proxyRequest(req, res) {
         res.write("data: [DONE]\n\n");
         clearInterval(heartbeatTimer);
         res.end();
-        logRequestSummary({ reqNum, method: req.method, url: req.url, status: 200, model, bridgeMode: `bridge:${bridgeMeta.protocol}`, toolCount: finalToolIndex, usage: upstreamUsage, finishReason: finalFinishReason });
+        logRequestSummary({ reqNum, method: req.method, url: req.url, status: 200, model, bridgeMode: `bridge:${bridgeMeta.protocol}`, toolCount: finalToolIndex, usage: upstreamUsage, cost: upstreamCost ?? upstreamUsage?.cost, finishReason: finalFinishReason });
         return;
     }
 
@@ -519,7 +527,7 @@ async function proxyRequest(req, res) {
                 const buf = Buffer.from(JSON.stringify(errorPayload), "utf8");
                 res.writeHead(502, { "content-type": "application/json; charset=utf-8", "content-length": String(buf.length) });
                 res.end(buf);
-                logRequestSummary({ reqNum, method: req.method, url: req.url, status: 502, model: aggregate?.model, bridgeMode: `bridge:${bridgeMeta?.protocol}`, usage: aggregate?.usage, finishReason: "error" });
+                logRequestSummary({ reqNum, method: req.method, url: req.url, status: 502, model: aggregate?.model, bridgeMode: `bridge:${bridgeMeta?.protocol}`, usage: aggregate?.usage, cost: aggregate?.cost, finishReason: "error" });
                 return;
             }
 
@@ -528,7 +536,7 @@ async function proxyRequest(req, res) {
             logSection("TRANSLATED RESPONSE", translated);
             const buf = Buffer.from(JSON.stringify(translated), "utf8");
             compressIfPossible(req, res, buf, "application/json; charset=utf-8");
-            logRequestSummary({ reqNum, method: req.method, url: req.url, status: 200, model: aggregate.model, bridgeMode: `bridge:${bridgeMeta.protocol}`, toolCount: bridgeResult.kind === "tool_calls" ? bridgeResult.message.tool_calls.length : 0, usage: aggregate.usage, cost: upstreamJson.value?.x_nanogpt_pricing?.amount, finishReason: bridgeResult.finishReason });
+            logRequestSummary({ reqNum, method: req.method, url: req.url, status: 200, model: aggregate.model, bridgeMode: `bridge:${bridgeMeta.protocol}`, toolCount: bridgeResult.kind === "tool_calls" ? bridgeResult.message.tool_calls.length : 0, usage: aggregate.usage, cost: aggregate.cost, finishReason: bridgeResult.finishReason });
             return;
         }
     }
@@ -546,18 +554,12 @@ async function proxyRequest(req, res) {
     }
 
     const rawBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
-    copyResponseHeaders(upstreamResponse.headers, res);
-    if (clientAcceptsGzip(req) && rawBuffer.length > 256) {
-        const compressed = zlib.gzipSync(rawBuffer);
-        res.setHeader("content-encoding", "gzip");
-        res.setHeader("content-length", String(compressed.length));
-        res.writeHead(upstreamResponse.status);
-        res.end(compressed);
-    } else {
-        res.setHeader("content-length", String(rawBuffer.length));
-        res.writeHead(upstreamResponse.status);
-        res.end(rawBuffer);
-    }
+    const passthroughHeaders = {};
+    upstreamResponse.headers.forEach((value, key) => {
+        if (UPSTREAM_STRIP_HEADERS.has(key.toLowerCase())) return;
+        passthroughHeaders[key] = value;
+    });
+    writeCompressed(req, res, upstreamResponse.status, passthroughHeaders, rawBuffer);
     logRequestSummary({ reqNum, method: req.method, url: req.url, status: upstreamResponse.status, bridgeMode: "passthrough" });
 }
 
@@ -567,8 +569,10 @@ function startServer() {
             log(`--- ERROR ---\n${error && error.stack ? error.stack : error}\n`);
             console.error("[NanoProxy Error]", error);
             if (!res.headersSent) {
-                res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
-                res.end(JSON.stringify({ error: { message: String(error && error.message ? error.message : error) } }));
+                const status = error && error.statusCode ? error.statusCode : 502;
+                const code = error && error.code ? error.code : (error && error.name === "AbortError" ? "upstream_timeout" : "proxy_error");
+                res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+                res.end(JSON.stringify({ error: { code, message: String(error && error.message ? error.message : error) } }));
             } else {
                 res.end();
             }
@@ -579,6 +583,26 @@ function startServer() {
         console.log(`NanoProxy listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
         if (ENABLE_DEBUG_LOGS && SESSION_LOG) console.log(`Session log: ${SESSION_LOG}`);
     });
+
+    let shuttingDown = false;
+    const shutdown = (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        log(`--- SHUTDOWN | signal=${signal} ---\n`);
+        const timer = setTimeout(() => {
+            log("--- SHUTDOWN TIMEOUT | forcing exit ---\n");
+            process.exit(1);
+        }, config.shutdownTimeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+        server.close(() => {
+            clearTimeout(timer);
+            log("--- SHUTDOWN COMPLETE ---\n");
+            process.exit(0);
+        });
+    };
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+    process.once("SIGINT", () => shutdown("SIGINT"));
+
     return server;
 }
 

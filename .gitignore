@@ -4,3 +4,6 @@ node_modules/
 Thumbs.db
 Logs/
 .debug-logging
+.kilo/
+.omo/
+.dirac-cache/
