@@ -4,6 +4,7 @@ const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { fetch, Agent } = require("undici");
 const core = require("./src/core.js");
 
 const {
@@ -25,6 +26,10 @@ const {
 const LISTEN_HOST = process.env.PROXY_HOST || "127.0.0.1";
 const LISTEN_PORT = Number(process.env.PROXY_PORT || "8787");
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || "https://nano-gpt.com/api/v1";
+// Node's fetch gives up after 5 minutes without response headers or between body chunks, which a
+// slow (e.g. batch) model regularly exceeds. 0 disables the limit.
+const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || "1800000");
+const upstreamAgent = new Agent({ headersTimeout: UPSTREAM_TIMEOUT_MS, bodyTimeout: UPSTREAM_TIMEOUT_MS });
 const DEBUG_FLAG_FILE = path.join(__dirname, ".debug-logging");
 const ENABLE_DEBUG_LOGS = process.env.NANO_PROXY_DEBUG === "1" || process.env.NANO_PROXY_DEBUG === "true" || fs.existsSync(DEBUG_FLAG_FILE);
 const LOG_DIR = path.join(__dirname, "Logs");
@@ -93,7 +98,8 @@ async function fetchUpstream(req, upstreamUrl, bodyBuffer) {
   return fetch(upstreamUrl, {
     method: req.method,
     headers: buildUpstreamHeaders(req.headers, bodyBuffer.length),
-    body: ["GET", "HEAD"].includes(req.method) ? undefined : bodyBuffer
+    body: ["GET", "HEAD"].includes(req.method) ? undefined : bodyBuffer,
+    dispatcher: upstreamAgent
   });
 }
 
