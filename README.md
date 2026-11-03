@@ -216,8 +216,11 @@ PROXY_HOST=127.0.0.1
 PROXY_PORT=8787
 BRIDGE_PROTOCOL=object
 BRIDGE_MODELS="glm-5,kimi-k2.5"
+UPSTREAM_TIMEOUT_MS=1800000
 node server.js
 ```
+
+`UPSTREAM_TIMEOUT_MS` is how long the server waits for NanoGPT to start responding, and between chunks of a streamed response, before giving up (default 30 minutes; `0` disables it). Node's built-in `fetch` stops at 5 minutes, which slow models regularly exceed, and the client then sees `502 fetch failed`.
 
 ### Server logging
 
@@ -275,7 +278,7 @@ Or with Compose:
 docker compose up --build
 ```
 
-Compose uses the same environment model as the server, so you can add values like `BRIDGE_PROTOCOL`, `BRIDGE_MODELS`, or `NANO_PROXY_DEBUG` there when needed.
+Compose uses the same environment model as the server, so you can add values like `BRIDGE_PROTOCOL`, `BRIDGE_MODELS`, `UPSTREAM_TIMEOUT_MS`, or `NANO_PROXY_DEBUG` there when needed.
 
 ## Logging Summary
 
